@@ -34,6 +34,7 @@ parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
+parser.add_argument("--load_scene", type=str, default=None, help="Path to a USD scene file to load.")
 parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
@@ -42,6 +43,20 @@ cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+
+if args_cli.task is None:
+    parser.error(
+        "--task is required. Example: --task=RobotLab-Navigation-Go2-v0 "
+        "--num_envs 1024 --load_scene source/robot_lab/data/environments/loco_navi_v1.usd"
+    )
+
+# Pass USD scene path via env var before hydra loads config
+if args_cli.load_scene:
+    import os as _os_train
+    _os_train.environ["NAVRL_USD_SCENE"] = args_cli.load_scene
+    # Also set obstacle JSON path (derived from USD path)
+    json_path = args_cli.load_scene.replace(".usda", "_obstacles.json").replace(".usd", "_obstacles.json")
+    _os_train.environ["NAVRL_OBSTACLE_JSON"] = json_path
 
 # always enable cameras to record video
 if args_cli.video:
