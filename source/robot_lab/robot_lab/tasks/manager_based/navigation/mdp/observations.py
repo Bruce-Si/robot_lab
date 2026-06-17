@@ -138,12 +138,18 @@ def _save_debug_data(lidar_all_envs, env):
     dist_2d = np.linalg.norm(goal_w - robot_w, axis=1)
     heading_err = cmd_term.heading_command_b.cpu().numpy()
     vel_body = robot.data.root_lin_vel_b[:, :2].cpu().numpy()
+    yaw_rate_body = robot.data.root_ang_vel_b[:, 2].cpu().numpy()
+    action = env.action_manager.action.detach().cpu().numpy()
+    yaw_rate_cmd = action[:, 1] if action.shape[1] > 1 else np.zeros(env.num_envs, dtype=np.float32)
 
     # Write individual npy files (reliable atomic writes)
     np.save("/tmp/navrl_lidar.npy", lidar)
     steps = env.episode_length_buf.float().cpu().numpy()
     np.save("/tmp/navrl_state.npy",
-            np.stack([dist_2d, heading_err, vel_body[:, 0], vel_body[:, 1], steps], axis=1).astype(np.float32))
+            np.stack(
+                [dist_2d, heading_err, vel_body[:, 0], vel_body[:, 1], steps, yaw_rate_body, yaw_rate_cmd],
+                axis=1,
+            ).astype(np.float32))
 
     # Terrain level distribution
     if env.scene.terrain is not None and hasattr(env.scene.terrain, "terrain_levels"):
@@ -172,6 +178,11 @@ def _save_reward_debug_data(env):
     names = np.asarray(reward_manager.active_terms, dtype="<U64")
     values = reward_manager._step_reward.detach().cpu().numpy().astype(np.float32)
     total = values.sum(axis=1).astype(np.float32)
+    episode_sums = np.stack(
+        [reward_manager._episode_sums[name].detach().cpu().numpy() for name in reward_manager.active_terms],
+        axis=1,
+    ).astype(np.float32)
+    episode_total = episode_sums.sum(axis=1).astype(np.float32)
     step = np.asarray([getattr(env, "common_step_counter", 0)], dtype=np.int64)
     episode_steps = env.episode_length_buf.detach().cpu().numpy().astype(np.int64)
     np.savez(
@@ -179,6 +190,8 @@ def _save_reward_debug_data(env):
         names=names,
         values=values,
         total=total,
+        episode_sums=episode_sums,
+        episode_total=episode_total,
         step=step,
         episode_steps=episode_steps,
     )

@@ -1,4 +1,4 @@
-# 四足 Navigation + Locomotion 项目交接总结
+# 四足 Navigation + Locomotion 项目交接文档
 
 更新时间：2026-06-15
 

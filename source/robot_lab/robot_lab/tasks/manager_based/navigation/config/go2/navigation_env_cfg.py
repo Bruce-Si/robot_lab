@@ -233,7 +233,7 @@ class RewardsCfg:
     )
     progress_towards_goal = RewTerm(
         func=mdp.progress_towards_goal,
-        weight=5.0,
+        weight=0.5,
         params={"command_name": "pose_command"},
     )
     lidar_obstacle = RewTerm(

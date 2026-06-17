@@ -16,9 +16,9 @@ REWARD_HISTORY = 100
 
 plt.ion()
 fig = plt.figure(figsize=(16.5, 9.0))
-fig.canvas.manager.set_window_title("NavRL Debug Viewer")
+fig.canvas.manager.set_window_title("Debug Viewer")
 
-ax_reward = fig.add_axes([0.055, 0.34, 0.58, 0.59])
+ax_reward = fig.add_axes([0.055, 0.59, 0.58, 0.34])
 ax_reward.set_title("Weighted reward terms", fontsize=13)
 ax_reward.set_xlabel("selected env episode step", fontsize=11)
 ax_reward.set_ylabel("reward / s", fontsize=11)
@@ -26,7 +26,17 @@ ax_reward.tick_params(labelsize=10)
 ax_reward.grid(True, alpha=0.25)
 reward_lines = {}
 total_reward_line = None
-ax_reward_labels = fig.add_axes([0.055, 0.075, 0.58, 0.20])
+
+ax_episode_reward = fig.add_axes([0.055, 0.28, 0.58, 0.22])
+ax_episode_reward.set_title("Episode cumulative reward", fontsize=12)
+ax_episode_reward.set_xlabel("selected env episode step", fontsize=10)
+ax_episode_reward.set_ylabel("return", fontsize=10)
+ax_episode_reward.tick_params(labelsize=9)
+ax_episode_reward.grid(True, alpha=0.25)
+episode_total_line = None
+episode_term_lines = {}
+
+ax_reward_labels = fig.add_axes([0.055, 0.065, 0.58, 0.15])
 ax_reward_labels.axis("off")
 
 ax_info = fig.add_axes([0.69, 0.57, 0.28, 0.36])
@@ -60,7 +70,15 @@ levels_cache = None
 rewards_cache = None
 typed = ""
 n_envs = 0
-reward_history = {"env": None, "step": [], "names": None, "values": [], "total": []}
+reward_history = {
+    "env": None,
+    "step": [],
+    "names": None,
+    "values": [],
+    "total": [],
+    "episode_sums": [],
+    "episode_total": [],
+}
 
 
 def _load():
@@ -96,6 +114,12 @@ def _load():
                     "names": data["names"].astype(str).tolist(),
                     "values": data["values"].astype(np.float32),
                     "total": data["total"].astype(np.float32),
+                    "episode_sums": data["episode_sums"].astype(np.float32)
+                    if "episode_sums" in data
+                    else None,
+                    "episode_total": data["episode_total"].astype(np.float32)
+                    if "episode_total" in data
+                    else None,
                     "global_step": int(data["step"][0]),
                     "episode_steps": data["episode_steps"].astype(np.int64)
                     if "episode_steps" in data
@@ -122,26 +146,46 @@ def _update_reward_history(eid, rewards):
         reward_history["names"] = rewards["names"]
         reward_history["values"] = []
         reward_history["total"] = []
+        reward_history["episode_sums"] = []
+        reward_history["episode_total"] = []
     if reward_history["step"] and step < reward_history["step"][-1]:
         reward_history["step"] = []
         reward_history["values"] = []
         reward_history["total"] = []
+        reward_history["episode_sums"] = []
+        reward_history["episode_total"] = []
     if reward_history["step"] and reward_history["step"][-1] == step:
         return
     reward_history["names"] = rewards["names"]
     reward_history["step"].append(step)
     reward_history["values"].append(rewards["values"][eid].copy())
     reward_history["total"].append(float(rewards["total"][eid]))
+    if rewards["episode_sums"] is not None and eid < rewards["episode_sums"].shape[0]:
+        reward_history["episode_sums"].append(rewards["episode_sums"][eid].copy())
+    else:
+        reward_history["episode_sums"].append(None)
+    if rewards["episode_total"] is not None and eid < rewards["episode_total"].shape[0]:
+        reward_history["episode_total"].append(float(rewards["episode_total"][eid]))
+    else:
+        reward_history["episode_total"].append(None)
     if len(reward_history["step"]) > REWARD_HISTORY:
         reward_history["step"] = reward_history["step"][-REWARD_HISTORY:]
         reward_history["values"] = reward_history["values"][-REWARD_HISTORY:]
         reward_history["total"] = reward_history["total"][-REWARD_HISTORY:]
+        reward_history["episode_sums"] = reward_history["episode_sums"][-REWARD_HISTORY:]
+        reward_history["episode_total"] = reward_history["episode_total"][-REWARD_HISTORY:]
 
 
 def _draw_rewards(eid, rewards):
     global total_reward_line
     _update_reward_history(eid, rewards)
     if not reward_history["step"]:
+        ax_episode_reward.clear()
+        ax_episode_reward.set_title("Episode cumulative reward", fontsize=12)
+        ax_episode_reward.set_xlabel("selected env episode step", fontsize=10)
+        ax_episode_reward.set_ylabel("return", fontsize=10)
+        ax_episode_reward.tick_params(labelsize=9)
+        ax_episode_reward.grid(True, alpha=0.25)
         ax_reward_labels.clear()
         ax_reward_labels.axis("off")
         ax_reward_labels.text(0.0, 0.65, "Waiting for rewards...",
@@ -173,8 +217,14 @@ def _draw_rewards(eid, rewards):
     if xs.size > 1:
         ax_reward.set_xlim(xs[0], xs[-1])
 
+    _draw_episode_rewards(xs, names)
+
     latest = values[-1]
-    rows = [("total", float(total[-1]), total_reward_line.get_color())]
+    latest_episode_total = reward_history["episode_total"][-1]
+    total_label = "total"
+    if latest_episode_total is not None:
+        total_label = f"total | ep {latest_episode_total: .1f}"
+    rows = [(total_label, float(total[-1]), total_reward_line.get_color())]
     rows.extend((name, float(latest[idx]), reward_lines[name].get_color()) for idx, name in enumerate(names))
 
     ax_reward_labels.clear()
@@ -217,6 +267,45 @@ def _draw_rewards(eid, rewards):
         )
 
 
+def _draw_episode_rewards(xs, names):
+    global episode_total_line
+    if not reward_history["episode_total"] or reward_history["episode_total"][-1] is None:
+        ax_episode_reward.clear()
+        ax_episode_reward.set_title("Episode cumulative reward", fontsize=12)
+        ax_episode_reward.set_xlabel("selected env episode step", fontsize=10)
+        ax_episode_reward.set_ylabel("return", fontsize=10)
+        ax_episode_reward.tick_params(labelsize=9)
+        ax_episode_reward.grid(True, alpha=0.25)
+        ax_episode_reward.text(0.02, 0.75, "Restart training to export episode sums",
+                               transform=ax_episode_reward.transAxes, fontsize=10)
+        return
+
+    episode_total = np.asarray(reward_history["episode_total"], dtype=np.float32)
+    episode_sums = np.asarray(reward_history["episode_sums"], dtype=np.float32)
+
+    if episode_total_line is None:
+        (episode_total_line,) = ax_episode_reward.plot(
+            xs, episode_total, color="black", linewidth=1.8, label="episode total"
+        )
+    else:
+        episode_total_line.set_data(xs, episode_total)
+
+    for idx, name in enumerate(names):
+        if name not in episode_term_lines:
+            (line,) = ax_episode_reward.plot(xs, episode_sums[:, idx], linewidth=0.9, alpha=0.75, label=name)
+            episode_term_lines[name] = line
+        else:
+            episode_term_lines[name].set_data(xs, episode_sums[:, idx])
+
+    for name, line in episode_term_lines.items():
+        line.set_visible(name in names)
+
+    ax_episode_reward.relim()
+    ax_episode_reward.autoscale_view()
+    if xs.size > 1:
+        ax_episode_reward.set_xlim(xs[0], xs[-1])
+
+
 def _draw(eid):
     lidar, state, levels, rewards = _load()
     if lidar is None:
@@ -233,6 +322,9 @@ def _draw(eid):
         s = state[eid]
         lvl = levels[eid] if levels is not None else -1
         pct = lambda c: f"{c / n_envs * 100:.0f}%"
+        yaw_rate = s[5] if s.shape[0] > 5 else np.nan
+        yaw_cmd = s[6] if s.shape[0] > 6 else np.nan
+        fmt_rate = lambda v: f"{v:5.2f} rad/s" if np.isfinite(v) else "  n/a"
         state_lines = [
             f"ENV {eid}  (L{lvl})  step {s[4]:.0f}",
             f"",
@@ -240,6 +332,8 @@ def _draw(eid):
             f"Heading err : {np.rad2deg(s[1]):4.0f} deg",
             f"Fwd vel     : {s[2]:5.2f} m/s",
             f"Lat vel     : {s[3]:5.2f} m/s",
+            f"Yaw rate    : {fmt_rate(yaw_rate)}",
+            f"Yaw cmd     : {fmt_rate(yaw_cmd)}",
             f"Min LiDAR   : {img.min():5.2f} m",
         ]
         if levels is not None:
