@@ -70,3 +70,23 @@ class NonStartEdgePose2dCommand(UniformPose2dCommand):
 
 class OppositeEdgePose2dCommand(NonStartEdgePose2dCommand):
     """Backward-compatible alias for configs that still reference the old class name."""
+
+
+class TargetFacingNonStartEdgePose2dCommand(NonStartEdgePose2dCommand):
+    """Sample edge goals while continuously pointing the heading at the target.
+
+    The base command may flip the heading by 180 degrees so a legged robot can walk
+    backward instead of turning around. The UAV carries a forward-facing gripper, so
+    its desired heading follows the live target bearing throughout the approach.
+    """
+
+    def _update_command(self):
+        target_vec = self.pos_command_w - self.robot.data.root_pos_w
+        target_distance = torch.linalg.norm(target_vec[:, :2], dim=1)
+        target_heading = torch.atan2(target_vec[:, 1], target_vec[:, 0])
+        self.heading_command_w[:] = torch.where(
+            target_distance > 1.0e-6,
+            target_heading,
+            self.heading_command_w,
+        )
+        super()._update_command()

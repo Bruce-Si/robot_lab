@@ -28,17 +28,22 @@ from isaaclab_tasks.manager_based.navigation.mdp import UniformPose2dCommandCfg
 
 from robot_lab.assets import ISAACLAB_ASSETS_DATA_DIR
 from robot_lab.assets.tilting_uav import TILTING_UAV_CFG
-from robot_lab.tasks.manager_based.navigation.mdp.commands import NonStartEdgePose2dCommand
+from robot_lab.tasks.manager_based.navigation.mdp.commands import (
+    TargetFacingNonStartEdgePose2dCommand,
+)
 from robot_lab.tasks.manager_based.navigation.mdp.events import reset_root_state_uniform_navigation
 from robot_lab.tasks.manager_based.navigation.mdp import rewards as navigation_rewards
-from robot_lab.tasks.manager_based.navigation.mdp import terminations as navigation_terminations
 from robot_lab.tasks.manager_based.navigation.mdp.uav_navigation import (
     altitude_out_of_bounds,
     excessive_tilt,
+    goal_pose_bonus,
+    goal_reached_with_heading,
+    near_goal_heading_error,
     planar_lidar_collision,
     planar_out_of_bounds,
     setup_uav_static_usd_scene,
     uav_contact_collision,
+    uav_navigation_privileged_state,
     uav_planar_policy_observation,
 )
 from robot_lab.tasks.manager_based.navigation.mdp.uav_velocity_action import (
@@ -51,6 +56,8 @@ _CELL_SIZE = 50.0
 _SCENE_ROWS = 8
 _SCENE_COLS = 8
 _LIDAR_RANGE = 4.0
+_GOAL_DISTANCE_THRESHOLD = 1.0
+_GOAL_HEADING_THRESHOLD = math.radians(20.0)
 
 
 def _resolve_scene_path() -> Path:
@@ -133,6 +140,7 @@ class ActionsCfg:
         asset_name="robot",
         planar_mode=True,
         velocity_scale=(1.0, 1.0, 1.0),
+        yaw_rate_scale=1.0,
         velocity_command_time_constant=0.15,
         altitude_hold_gain=1.5,
         altitude_hold_max_velocity=0.8,
@@ -149,6 +157,7 @@ class ObservationsCfg:
                 "command_name": "pose_command",
                 "goal_distance_scale": _CELL_SIZE,
                 "velocity_scale": 1.0,
+                "yaw_rate_scale": 1.0,
                 "max_distance": _LIDAR_RANGE,
                 "debug_draw": True,
             },
@@ -158,13 +167,32 @@ class ObservationsCfg:
             self.concatenate_terms = True
             self.enable_corruption = False
 
+    @configclass
+    class PrivilegedCfg(ObsGroup):
+        state = ObsTerm(
+            func=uav_navigation_privileged_state,
+            params={
+                "command_name": "pose_command",
+                "action_term_name": "uav_velocity",
+                "cell_size": _CELL_SIZE,
+                "num_rows": _SCENE_ROWS,
+                "num_cols": _SCENE_COLS,
+                "velocity_scale": 1.0,
+            },
+        )
+
+        def __post_init__(self):
+            self.concatenate_terms = True
+            self.enable_corruption = False
+
     policy: PolicyCfg = PolicyCfg()
+    privileged: PrivilegedCfg = PrivilegedCfg()
 
 
 @configclass
 class CommandsCfg:
     pose_command = UniformPose2dCommandCfg(
-        class_type=NonStartEdgePose2dCommand,
+        class_type=TargetFacingNonStartEdgePose2dCommand,
         asset_name="robot",
         simple_heading=True,
         resampling_time_range=(1.0e9, 1.0e9),
@@ -201,9 +229,18 @@ class RewardsCfg:
         },
     )
     goal_bonus = RewTerm(
-        func=navigation_rewards.goal_bonus,
+        func=goal_pose_bonus,
         weight=200.0,
-        params={"command_name": "pose_command", "distance_threshold": 1.0},
+        params={
+            "command_name": "pose_command",
+            "distance_threshold": _GOAL_DISTANCE_THRESHOLD,
+            "heading_threshold": _GOAL_HEADING_THRESHOLD,
+        },
+    )
+    terminal_heading = RewTerm(
+        func=near_goal_heading_error,
+        weight=-2.0,
+        params={"command_name": "pose_command", "distance_scale": 2.0},
     )
     action_rate = RewTerm(func=navigation_rewards.action_rate_l2, weight=-0.01)
 
@@ -223,8 +260,12 @@ class TerminationsCfg:
         params={"half_size": _CELL_SIZE / 2.0, "distance_buffer": 0.5},
     )
     goal_reached = DoneTerm(
-        func=navigation_terminations.goal_reached,
-        params={"command_name": "pose_command", "distance_threshold": 1.0},
+        func=goal_reached_with_heading,
+        params={
+            "command_name": "pose_command",
+            "distance_threshold": _GOAL_DISTANCE_THRESHOLD,
+            "heading_threshold": _GOAL_HEADING_THRESHOLD,
+        },
         time_out=True,
     )
 
@@ -286,6 +327,7 @@ class TiltingUAVNavigationEnvCfg(ManagerBasedRLEnvCfg):
     events: EventCfg = EventCfg()
 
     def __post_init__(self):
+        # Run flight physics at 400 Hz while preserving the 10 Hz policy and LiDAR period.
         self.sim.dt = 0.0025
         self.decimation = 40
         self.sim.render_interval = self.decimation

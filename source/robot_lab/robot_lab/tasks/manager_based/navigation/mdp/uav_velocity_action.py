@@ -20,11 +20,11 @@ class TiltingUAVVelocityAction(ActionTerm):
     """Convert normalized yaw-frame velocity commands into a tilting-UAV body wrench.
 
     In the default mode, the policy controls ``(vx, vy, vz)``. In planar mode, it
-    controls only ``(vx, vy)`` while an outer loop supplies the vertical velocity
-    needed to hold the reset altitude. Roll and pitch are held level, yaw is captured
-    at reset, and the gripper remains at its open default joint positions. All
-    controller, allocation, and actuator calculations are batched Torch operations on
-    the simulation device.
+    controls ``(vx, vy, yaw_rate)`` while an outer loop supplies the vertical velocity
+    needed to hold the reset altitude. Roll and pitch are held level, the commanded yaw
+    rate is integrated into a yaw target, and the gripper remains at its open default
+    joint positions. All controller, allocation, and actuator calculations are batched
+    Torch operations on the simulation device.
     """
 
     _asset: Articulation
@@ -43,6 +43,8 @@ class TiltingUAVVelocityAction(ActionTerm):
             raise ValueError("altitude_hold_max_velocity must be positive in planar mode.")
         if cfg.velocity_command_time_constant < 0.0:
             raise ValueError("velocity_command_time_constant cannot be negative.")
+        if cfg.planar_mode and cfg.yaw_rate_scale <= 0.0:
+            raise ValueError("yaw_rate_scale must be positive in planar mode.")
         if len(cfg.rotor_positions) != 4 or len(cfg.rotor_alpha_deg) != 4:
             raise ValueError("The registered tilting UAV controller requires exactly four rotors.")
 
@@ -83,10 +85,13 @@ class TiltingUAVVelocityAction(ActionTerm):
         self._kd_rate = self._tensor(cfg.kd_rate)
         self._torque_max = self._tensor(cfg.torque_max)
 
-        self._action_dim = 2 if cfg.planar_mode else 3
+        self._velocity_dim = 2 if cfg.planar_mode else 3
+        self._action_dim = self._velocity_dim + int(cfg.planar_mode)
         self._raw_actions = torch.zeros(self.num_envs, self._action_dim, device=self.device)
         self._velocity_command_target = torch.zeros(self.num_envs, 3, device=self.device)
         self._processed_actions = torch.zeros(self.num_envs, 3, device=self.device)
+        self._yaw_rate_command_target = torch.zeros(self.num_envs, device=self.device)
+        self._processed_yaw_rate = torch.zeros(self.num_envs, device=self.device)
         self._desired_velocity_w = torch.zeros_like(self._processed_actions)
         self._desired_force_w = torch.zeros_like(self._processed_actions)
         self._desired_wrench_b = torch.zeros(self.num_envs, 6, device=self.device)
@@ -130,6 +135,14 @@ class TiltingUAVVelocityAction(ActionTerm):
     @property
     def velocity_command_target(self) -> torch.Tensor:
         return self._velocity_command_target
+
+    @property
+    def yaw_rate_command_target(self) -> torch.Tensor:
+        return self._yaw_rate_command_target
+
+    @property
+    def processed_yaw_rate(self) -> torch.Tensor:
+        return self._processed_yaw_rate
 
     @property
     def desired_velocity_w(self) -> torch.Tensor:
@@ -183,13 +196,15 @@ class TiltingUAVVelocityAction(ActionTerm):
             raise ValueError(f"Expected actions with shape {self._raw_actions.shape}, got {actions.shape}.")
         self._raw_actions[:] = actions
         bounded_actions = torch.nan_to_num(actions, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
-        self._velocity_command_target[:, : self._action_dim] = (
-            bounded_actions * self._velocity_scale[: self._action_dim]
+        self._velocity_command_target[:, : self._velocity_dim] = (
+            bounded_actions[:, : self._velocity_dim] * self._velocity_scale[: self._velocity_dim]
         )
         if self.cfg.planar_mode:
             self._velocity_command_target[:, 2] = 0.0
+            self._yaw_rate_command_target[:] = bounded_actions[:, 2] * self.cfg.yaw_rate_scale
         if self.cfg.velocity_command_time_constant <= 0.0:
             self._processed_actions[:] = self._velocity_command_target
+            self._processed_yaw_rate[:] = self._yaw_rate_command_target
         elif self.cfg.planar_mode:
             self._processed_actions[:, 2] = 0.0
 
@@ -202,13 +217,17 @@ class TiltingUAVVelocityAction(ActionTerm):
             command_alpha = 1.0 - math.exp(
                 -self._physics_dt / self.cfg.velocity_command_time_constant
             )
-            self._processed_actions[:, : self._action_dim].add_(
+            self._processed_actions[:, : self._velocity_dim].add_(
                 command_alpha
                 * (
-                    self._velocity_command_target[:, : self._action_dim]
-                    - self._processed_actions[:, : self._action_dim]
+                    self._velocity_command_target[:, : self._velocity_dim]
+                    - self._processed_actions[:, : self._velocity_dim]
                 )
             )
+            if self.cfg.planar_mode:
+                self._processed_yaw_rate.add_(
+                    command_alpha * (self._yaw_rate_command_target - self._processed_yaw_rate)
+                )
 
         if self.cfg.planar_mode:
             altitude_error = self._target_altitude - self._asset.data.root_pos_w[:, 2]
@@ -217,6 +236,8 @@ class TiltingUAVVelocityAction(ActionTerm):
                 -self.cfg.altitude_hold_max_velocity,
                 self.cfg.altitude_hold_max_velocity,
             )
+            self._target_yaw.add_(self._processed_yaw_rate * self._physics_dt)
+            self._target_yaw[:] = math_utils.wrap_to_pi(self._target_yaw)
 
         self._desired_velocity_w[:] = math_utils.quat_apply_yaw(root_quat_w, self._processed_actions)
         velocity_error = self._desired_velocity_w - root_lin_vel_w
@@ -270,6 +291,8 @@ class TiltingUAVVelocityAction(ActionTerm):
         self._raw_actions[env_ids_tensor] = 0.0
         self._velocity_command_target[env_ids_tensor] = 0.0
         self._processed_actions[env_ids_tensor] = 0.0
+        self._yaw_rate_command_target[env_ids_tensor] = 0.0
+        self._processed_yaw_rate[env_ids_tensor] = 0.0
         self._desired_velocity_w[env_ids_tensor] = 0.0
         self._desired_force_w[env_ids_tensor] = 0.0
         self._desired_wrench_b[env_ids_tensor] = 0.0
@@ -329,6 +352,8 @@ class TiltingUAVVelocityAction(ActionTerm):
             + self._ki_att * self._attitude_integral_error
             - self._kd_att * self._attitude_derivative_lpf
         )
+        if self.cfg.planar_mode:
+            angular_velocity_command[:, 2].add_(self._processed_yaw_rate)
 
         rate_error = angular_velocity_command - root_ang_vel_b
         angular_acceleration_feedback = (
@@ -447,6 +472,7 @@ class TiltingUAVVelocityActionCfg(ActionTermCfg):
     altitude_hold_max_velocity: float = 0.8
     velocity_command_time_constant: float = 0.0
     velocity_scale: tuple[float, float, float] = (1.5, 1.5, 1.0)
+    yaw_rate_scale: float = 1.0
 
     mass: float = 2.43
     gravity: float = 9.81

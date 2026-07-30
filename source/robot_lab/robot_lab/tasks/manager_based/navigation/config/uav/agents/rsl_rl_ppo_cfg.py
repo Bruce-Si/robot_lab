@@ -1,7 +1,7 @@
 # Copyright (c) 2024-2026 Ziqi Fan
 # SPDX-License-Identifier: Apache-2.0
 
-"""RSL-RL PPO configuration for 42D planar UAV navigation observations."""
+"""RSL-RL PPO configuration for the privileged UAV data-collection expert."""
 
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
@@ -12,9 +12,12 @@ class TiltingUAVNavPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 32
     max_iterations = 5000
     save_interval = 100
-    experiment_name = "tilting_uav_navrl_planar"
+    experiment_name = "tilting_uav_navrl_planar_yaw_oracle"
     clip_actions = 1.0
-    obs_groups = {"actor": ["policy"], "critic": ["policy"]}
+    obs_groups = {
+        "actor": ["policy", "privileged"],
+        "critic": ["policy", "privileged"],
+    }
 
     actor = RslRlMLPModelCfg(
         hidden_dims=[256, 256, 128],

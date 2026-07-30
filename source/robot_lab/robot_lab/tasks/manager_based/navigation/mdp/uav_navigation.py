@@ -6,13 +6,16 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor, RayCaster
+from isaaclab.utils.math import wrap_to_pi
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
@@ -20,6 +23,12 @@ if TYPE_CHECKING:
 
 PLANAR_LIDAR_RAY_COUNT = 36
 """Number of rays in the 360-degree, 10-degree planar scan."""
+
+PLANAR_POLICY_STATE_DIM = 7
+"""Deployment-visible state features concatenated before the planar LiDAR scan."""
+
+UAV_PRIVILEGED_STATE_DIM = 95
+"""Simulator-only expert features for the fixed 8-by-8 navigation scene."""
 
 
 def planar_lidar_distances(
@@ -70,13 +79,14 @@ def uav_planar_state(
     command_name: str = "pose_command",
     goal_distance_scale: float = 50.0,
     velocity_scale: float = 1.5,
+    yaw_rate_scale: float = 1.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Return the six planar state features used beside the LiDAR scan.
+    """Return the seven deployment-visible state features beside the LiDAR scan.
 
-    The features are relative goal XY, body-frame velocity XY, and sine/cosine
-    of the live goal bearing. Position and velocity are normalized by fixed
-    deployment-visible scales.
+    The features are relative goal XY, body-frame velocity XY, sine/cosine of the
+    live goal bearing, and body yaw rate. All inputs are available from localization
+    and the IMU.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     command = env.command_manager.get_command(command_name)
@@ -84,7 +94,8 @@ def uav_planar_state(
     velocity_xy_b = asset.data.root_lin_vel_b[:, :2] / max(velocity_scale, 1.0e-6)
     goal_bearing = torch.atan2(command[:, 1], command[:, 0])
     bearing_features = torch.stack((torch.sin(goal_bearing), torch.cos(goal_bearing)), dim=-1)
-    return torch.cat((goal_xy_b, velocity_xy_b, bearing_features), dim=-1)
+    yaw_rate = asset.data.root_ang_vel_b[:, 2:3] / max(yaw_rate_scale, 1.0e-6)
+    return torch.cat((goal_xy_b, velocity_xy_b, bearing_features, yaw_rate), dim=-1)
 
 
 def uav_planar_policy_observation(
@@ -92,17 +103,19 @@ def uav_planar_policy_observation(
     command_name: str = "pose_command",
     goal_distance_scale: float = 50.0,
     velocity_scale: float = 1.5,
+    yaw_rate_scale: float = 1.0,
     max_distance: float = 4.0,
     debug_draw: bool = True,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("lidar"),
 ) -> torch.Tensor:
-    """Concatenate six navigation features and the 36-ray scan for an MLP."""
+    """Concatenate seven navigation features and the 36-ray scan for an MLP."""
     state = uav_planar_state(
         env,
         command_name=command_name,
         goal_distance_scale=goal_distance_scale,
         velocity_scale=velocity_scale,
+        yaw_rate_scale=yaw_rate_scale,
         asset_cfg=asset_cfg,
     )
     lidar = uav_planar_lidar_proximity(env, sensor_cfg=sensor_cfg, max_distance=max_distance)
@@ -114,6 +127,153 @@ def uav_planar_policy_observation(
             max_distance=max_distance,
         )
     return torch.cat((state, lidar), dim=-1)
+
+
+def uav_navigation_privileged_state(
+    env: ManagerBasedRLEnv,
+    command_name: str = "pose_command",
+    action_term_name: str = "uav_velocity",
+    cell_size: float = 50.0,
+    num_rows: int = 8,
+    num_cols: int = 8,
+    velocity_scale: float = 1.5,
+    altitude_error_scale: float = 0.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return simulator-only state for the navigation data-collection expert.
+
+    The actor and critic receive exact map-cell identity and coordinates, full rigid-body
+    motion, attitude, controller tracking error, and actuator state. This intentionally
+    privileged policy is trained only to collect successful simulation trajectories.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    command_term = env.command_manager.get_term(command_name)
+    action_term = env.action_manager.get_term(action_term_name)
+
+    half_cell = max(0.5 * cell_size, 1.0e-6)
+    local_position_xy = (
+        asset.data.root_pos_w[:, :2] - env.scene.env_origins[:, :2]
+    ) / half_cell
+    goal_local_xy = (
+        command_term.pos_command_w[:, :2] - env.scene.env_origins[:, :2]
+    ) / half_cell
+    altitude_error = (
+        (asset.data.root_pos_w[:, 2] - action_term.target_altitude)
+        / max(altitude_error_scale, 1.0e-6)
+    ).unsqueeze(-1)
+
+    heading_w = asset.data.heading_w
+    heading_features = torch.stack((torch.sin(heading_w), torch.cos(heading_w)), dim=-1)
+    root_lin_vel_b = asset.data.root_lin_vel_b.clone()
+    root_lin_vel_b[:, :2] /= max(velocity_scale, 1.0e-6)
+    root_lin_vel_b[:, 2] /= max(action_term.cfg.altitude_hold_max_velocity, 1.0e-6)
+    root_ang_vel_b = asset.data.root_ang_vel_b / max(action_term.cfg.yaw_rate_scale, 1.0e-6)
+    projected_gravity_b = asset.data.projected_gravity_b
+
+    controller_yaw_error = wrap_to_pi(action_term.target_yaw - heading_w)
+    controller_yaw_features = torch.stack(
+        (torch.sin(controller_yaw_error), torch.cos(controller_yaw_error)), dim=-1
+    )
+
+    cell_index = getattr(env, "_uav_navigation_cell_index", None)
+    if cell_index is None:
+        cell_index = torch.arange(env.num_envs, device=env.device) % (num_rows * num_cols)
+    row = torch.div(cell_index, num_cols, rounding_mode="floor").to(torch.float32)
+    col = (cell_index % num_cols).to(torch.float32)
+    row = 2.0 * row / max(num_rows - 1, 1) - 1.0
+    col = 2.0 * col / max(num_cols - 1, 1) - 1.0
+    cell_coordinates = torch.stack((row, col), dim=-1)
+    scene_identity = F.one_hot(
+        cell_index.to(torch.long), num_classes=num_rows * num_cols
+    ).to(asset.data.root_pos_w.dtype)
+
+    velocity_integral = action_term.velocity_integral_error / max(
+        action_term.cfg.vel_integral_limit, 1.0e-6
+    )
+    thrust_state = action_term.thrust_actual / max(action_term.cfg.thrust_max, 1.0e-6)
+    servo_state = action_term.servo_angle_actual / max(
+        action_term.cfg.servo_angle_limit, 1.0e-6
+    )
+
+    return torch.cat(
+        (
+            local_position_xy,
+            goal_local_xy,
+            altitude_error,
+            heading_features,
+            root_lin_vel_b,
+            root_ang_vel_b,
+            projected_gravity_b,
+            controller_yaw_features,
+            cell_coordinates,
+            scene_identity,
+            velocity_integral,
+            thrust_state,
+            servo_state,
+        ),
+        dim=-1,
+    )
+
+
+def _goal_pose_errors(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return planar distance and absolute terminal-heading error."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    command_term = env.command_manager.get_term(command_name)
+    goal_delta = command_term.pos_command_w[:, :2] - asset.data.root_pos_w[:, :2]
+    distance = torch.linalg.norm(goal_delta, dim=1)
+    live_goal_heading = torch.atan2(goal_delta[:, 1], goal_delta[:, 0])
+    live_goal_heading = torch.where(
+        distance > 1.0e-6,
+        live_goal_heading,
+        command_term.heading_command_w,
+    )
+    heading_error = torch.abs(wrap_to_pi(live_goal_heading - asset.data.heading_w))
+    return distance, heading_error
+
+
+def goal_reached_with_heading(
+    env: ManagerBasedRLEnv,
+    command_name: str = "pose_command",
+    distance_threshold: float = 1.0,
+    heading_threshold: float = math.radians(20.0),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Succeed only when both planar position and terminal yaw are within tolerance."""
+    distance, heading_error = _goal_pose_errors(env, command_name, asset_cfg)
+    return (distance < distance_threshold) & (heading_error < heading_threshold)
+
+
+def goal_pose_bonus(
+    env: ManagerBasedRLEnv,
+    command_name: str = "pose_command",
+    distance_threshold: float = 1.0,
+    heading_threshold: float = math.radians(20.0),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return a sparse bonus using the same pose condition as success termination."""
+    return goal_reached_with_heading(
+        env,
+        command_name=command_name,
+        distance_threshold=distance_threshold,
+        heading_threshold=heading_threshold,
+        asset_cfg=asset_cfg,
+    ).float()
+
+
+def near_goal_heading_error(
+    env: ManagerBasedRLEnv,
+    command_name: str = "pose_command",
+    distance_scale: float = 2.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return normalized yaw error, smoothly gated to the terminal approach region."""
+    distance, heading_error = _goal_pose_errors(env, command_name, asset_cfg)
+    proximity = torch.exp(-torch.square(distance / max(distance_scale, 1.0e-6)))
+    return proximity * heading_error / math.pi
 
 
 def _draw_planar_lidar_debug_lines(
@@ -268,6 +428,53 @@ def planar_out_of_bounds(
     return torch.any(torch.abs(local_xy) > half_size - distance_buffer, dim=1)
 
 
+def set_uav_navigation_cells(
+    env: ManagerBasedEnv,
+    cell_indices: int | Sequence[int] | torch.Tensor | None = None,
+    cell_size: float = 50.0,
+    num_rows: int = 8,
+    num_cols: int = 8,
+) -> torch.Tensor:
+    """Map each environment origin to a cell in the shared static USD grid.
+
+    Passing ``None`` distributes environments cyclically over the full grid. A
+    scalar maps every environment to the same cell, which is used for policy
+    evaluation on one selected obstacle layout.
+    """
+    if cell_size <= 0.0 or num_rows <= 0 or num_cols <= 0:
+        raise ValueError("Static USD grid dimensions must be positive.")
+
+    num_cells = num_rows * num_cols
+    if cell_indices is None:
+        indices = torch.arange(env.num_envs, device=env.device, dtype=torch.long) % num_cells
+    else:
+        indices = torch.as_tensor(cell_indices, device=env.device, dtype=torch.long)
+        if indices.ndim == 0:
+            indices = indices.expand(env.num_envs).clone()
+        else:
+            indices = indices.flatten()
+            if indices.numel() != env.num_envs:
+                raise ValueError(
+                    f"Expected one cell index or {env.num_envs} indices, got {indices.numel()}."
+                )
+
+    if torch.any((indices < 0) | (indices >= num_cells)):
+        minimum = int(indices.min().item())
+        maximum = int(indices.max().item())
+        raise ValueError(
+            f"Cell indices must be in [0, {num_cells - 1}], got range [{minimum}, {maximum}]."
+        )
+
+    row = torch.div(indices, num_cols, rounding_mode="floor")
+    col = indices % num_cols
+    origins = torch.zeros(env.num_envs, 3, device=env.device)
+    origins[:, 0] = (col.to(torch.float32) + 0.5) * cell_size
+    origins[:, 1] = (row.to(torch.float32) + 0.5) * cell_size
+    env.scene._default_env_origins = origins
+    env._uav_navigation_cell_index = indices
+    return indices
+
+
 def setup_uav_static_usd_scene(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor | None,
@@ -278,18 +485,13 @@ def setup_uav_static_usd_scene(
 ) -> None:
     """Enable static-scene collisions and map environments onto its cell grid."""
     del env_ids
-    if cell_size <= 0.0 or num_rows <= 0 or num_cols <= 0:
-        raise ValueError("Static USD grid dimensions must be positive.")
-
-    env_index = torch.arange(env.num_envs, device=env.device)
-    cell_index = env_index % (num_rows * num_cols)
-    row = torch.div(cell_index, num_cols, rounding_mode="floor")
-    col = cell_index % num_cols
-    origins = torch.zeros(env.num_envs, 3, device=env.device)
-    origins[:, 0] = (col.to(torch.float32) + 0.5) * cell_size
-    origins[:, 1] = (row.to(torch.float32) + 0.5) * cell_size
-    env.scene._default_env_origins = origins
-    env._uav_navigation_cell_index = cell_index
+    set_uav_navigation_cells(
+        env,
+        cell_indices=None,
+        cell_size=cell_size,
+        num_rows=num_rows,
+        num_cols=num_cols,
+    )
 
     import isaaclab.sim as sim_utils
     from isaaclab.sim import schemas

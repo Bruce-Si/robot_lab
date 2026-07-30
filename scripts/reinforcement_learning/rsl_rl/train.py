@@ -36,6 +36,18 @@ parser.add_argument(
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
 parser.add_argument("--load_scene", type=str, default=None, help="Path to a USD scene file to load.")
 parser.add_argument(
+    "--eval_interval",
+    type=int,
+    default=0,
+    help="Run deterministic UAV evaluation every N learning iterations; zero disables it.",
+)
+parser.add_argument("--eval_level", type=int, default=7, help="USD grid row used for periodic UAV evaluation.")
+parser.add_argument("--eval_variant", type=int, default=7, help="USD grid column used for periodic UAV evaluation.")
+parser.add_argument("--eval_seed", type=int, default=42, help="Fixed seed used for comparable periodic evaluations.")
+parser.add_argument(
+    "--eval_episodes_per_env", type=int, default=1, help="Completed evaluation episodes per environment."
+)
+parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
 # append RSL-RL cli arguments
@@ -49,6 +61,14 @@ if args_cli.task is None:
         "--task is required. Example: --task=RobotLab-Navigation-Go2-v0 "
         "--num_envs 1024 --load_scene source/robot_lab/data/environments/loco_navi_v1.usd"
     )
+if args_cli.eval_interval < 0:
+    parser.error("--eval_interval cannot be negative.")
+if not 0 <= args_cli.eval_level < 8:
+    parser.error("--eval_level must be in [0, 7].")
+if not 0 <= args_cli.eval_variant < 8:
+    parser.error("--eval_variant must be in [0, 7].")
+if args_cli.eval_episodes_per_env <= 0:
+    parser.error("--eval_episodes_per_env must be positive.")
 
 # Pass USD scene path via env var before hydra loads config
 if args_cli.load_scene:
@@ -119,6 +139,14 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import robot_lab.tasks  # noqa: F401  # isort: skip
 
+from uav_navigation_eval import (  # isort: skip
+    PeriodicEvaluationOnPolicyRunner,
+    evaluate_uav_navigation,
+    log_evaluation_scalars,
+    print_evaluation_summary,
+    write_evaluation_json,
+)
+
 # import logger
 logger = logging.getLogger(__name__)
 
@@ -163,6 +191,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         seed = agent_cfg.seed + app_launcher.local_rank
         env_cfg.seed = seed
         agent_cfg.seed = seed
+
+    if args_cli.eval_interval > 0:
+        if args_cli.distributed:
+            raise ValueError("Periodic UAV evaluation currently supports single-process training only.")
+        if args_cli.task.split(":")[-1] != "RobotLab-Navigation-Tilting-UAV-v0":
+            raise ValueError("--eval_interval is currently implemented only for the tilting-UAV navigation task.")
+        if agent_cfg.class_name != "OnPolicyRunner":
+            raise ValueError("Periodic UAV evaluation requires an OnPolicyRunner agent.")
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -216,9 +252,54 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
+    eval_cell_index = args_cli.eval_level * 8 + args_cli.eval_variant
+
+    def run_periodic_evaluation(eval_runner: OnPolicyRunner, iteration: int) -> None:
+        checkpoint_path = os.path.join(log_dir, f"model_{iteration}.pt")
+        if iteration % eval_runner.cfg["save_interval"] != 0 or not os.path.isfile(checkpoint_path):
+            eval_runner.save(checkpoint_path)
+
+        print(
+            f"[INFO] Starting deterministic UAV evaluation at iteration {iteration}: "
+            f"cell={eval_cell_index} (level={args_cli.eval_level}, variant={args_cli.eval_variant}), "
+            f"envs={env.num_envs}, episodes_per_env={args_cli.eval_episodes_per_env}."
+        )
+        policy = eval_runner.get_inference_policy(device=env.unwrapped.device)
+        result = evaluate_uav_navigation(
+            env,
+            policy,
+            cell_index=eval_cell_index,
+            episodes_per_env=args_cli.eval_episodes_per_env,
+            seed=args_cli.eval_seed,
+            restore_training_cells=True,
+        )
+        result["task"] = args_cli.task
+        result["checkpoint"] = os.path.abspath(checkpoint_path)
+        result["checkpoint_iteration"] = iteration
+        output_path = write_evaluation_json(
+            result,
+            os.path.join(
+                log_dir,
+                "evaluations",
+                f"iteration_{iteration:06d}_cell_{eval_cell_index:02d}.json",
+            ),
+        )
+        log_evaluation_scalars(eval_runner.logger.writer, result, iteration)
+        print_evaluation_summary(result, output_path)
+
     # create runner from rsl-rl
     if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        if args_cli.eval_interval > 0:
+            runner = PeriodicEvaluationOnPolicyRunner(
+                env,
+                agent_cfg.to_dict(),
+                log_dir=log_dir,
+                device=agent_cfg.device,
+                evaluation_interval=args_cli.eval_interval,
+                evaluation_callback=run_periodic_evaluation,
+            )
+        else:
+            runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     else:
@@ -236,6 +317,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
     # run training
+    if args_cli.eval_interval > 0:
+        print(
+            f"[INFO] Periodic UAV evaluation enabled: interval={args_cli.eval_interval}, "
+            f"cell={eval_cell_index}, seed={args_cli.eval_seed}, "
+            f"episodes_per_env={args_cli.eval_episodes_per_env}."
+        )
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
 
     print(f"Training time: {round(time.time() - start_time, 2)} seconds")
