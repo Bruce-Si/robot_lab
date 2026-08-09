@@ -187,6 +187,35 @@ python scripts/reinforcement_learning/rsl_rl/train.py \
 
 训练期间的周期评估目前只支持注册的 UAV 导航任务和单进程训练。评估 JSON 会写入当前训练 run 的 `evaluations/` 目录。
 
+## 下载已训练导航模型
+
+当前推荐的导航模型为 GitHub Release `uav-navrl-model-2100` 中的 `model_2100.pt`，对应源码
+commit `797a8c4`。从项目根目录下载到组合脚本和本文评估命令使用的默认位置：
+
+```bash
+mkdir -p logs/rsl_rl/tilting_uav_navrl_planar_yaw_oracle/2026-07-27_21-27-40
+
+curl -L --fail \
+  https://github.com/Bruce-Si/robot_lab/releases/download/uav-navrl-model-2100/model_2100.pt \
+  -o logs/rsl_rl/tilting_uav_navrl_planar_yaw_oracle/2026-07-27_21-27-40/model_2100.pt
+```
+
+下载后校验文件完整性：
+
+```bash
+sha256sum logs/rsl_rl/tilting_uav_navrl_planar_yaw_oracle/2026-07-27_21-27-40/model_2100.pt
+```
+
+期望结果：
+
+```text
+837c5aa2a8f9677eb18122eac76966225a1cf72f14f437afc5abb246f86a3b6b
+```
+
+该模型以 400 Hz 物理频率训练，actor 输入为 138 维（43 维 policy 加 95 维 privileged），
+动作为 3 维平面速度和 yaw 角速度。Release 页面：
+<https://github.com/Bruce-Si/robot_lab/releases/tag/uav-navrl-model-2100>。
+
 ## 导航避障评估
 
 使用 1024 架无人机、评估最难的 `Cell_7_7`，并将物理频率降到 60 Hz：
