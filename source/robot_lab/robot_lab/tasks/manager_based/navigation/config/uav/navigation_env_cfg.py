@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import math
-import os
 from pathlib import Path
 
 import isaaclab.envs.mdp as base_mdp
@@ -26,7 +25,6 @@ from isaaclab.utils import configclass
 
 from isaaclab_tasks.manager_based.navigation.mdp import UniformPose2dCommandCfg
 
-from robot_lab.assets import ISAACLAB_ASSETS_DATA_DIR
 from robot_lab.assets.tilting_uav import TILTING_UAV_CFG
 from robot_lab.tasks.manager_based.navigation.mdp.commands import (
     TargetFacingNonStartEdgePose2dCommand,
@@ -41,6 +39,7 @@ from robot_lab.tasks.manager_based.navigation.mdp.uav_navigation import (
     near_goal_heading_error,
     planar_lidar_collision,
     planar_out_of_bounds,
+    setup_uav_single_static_usd_scene,
     setup_uav_static_usd_scene,
     uav_contact_collision,
     uav_navigation_privileged_state,
@@ -49,38 +48,66 @@ from robot_lab.tasks.manager_based.navigation.mdp.uav_navigation import (
 from robot_lab.tasks.manager_based.navigation.mdp.uav_velocity_action import (
     TiltingUAVVelocityActionCfg,
 )
+from robot_lab.tasks.manager_based.navigation.config.uav.scene_profile import (
+    GRID_8X8_PROFILE,
+    WAREHOUSE_100M_PROFILE,
+    UavNavigationSceneProfile,
+    resolve_scene_path,
+)
 
 
 _SCENE_ROOT = "/World/uav_navigation_scene"
-_CELL_SIZE = 50.0
-_SCENE_ROWS = 8
-_SCENE_COLS = 8
+_CELL_SIZE = GRID_8X8_PROFILE.cell_size
+_SCENE_ROWS = GRID_8X8_PROFILE.rows
+_SCENE_COLS = GRID_8X8_PROFILE.columns
 _LIDAR_RANGE = 4.0
 _GOAL_DISTANCE_THRESHOLD = 1.0
-_GOAL_HEADING_THRESHOLD = math.radians(20.0)
+_GOAL_HEADING_THRESHOLD = math.radians(10.0)
 
 
-def _resolve_scene_path() -> Path:
-    default_path = (
-        Path(ISAACLAB_ASSETS_DATA_DIR)
-        / "environments"
-        / "loco_navi_curriculum_flat_v1_baked_round_prims.usd"
-    )
-    configured_path = (
-        os.environ.get("NAVRL_UAV_USD_SCENE")
-        or os.environ.get("NAVRL_USD_SCENE")
-        or str(default_path)
-    )
-    scene_path = Path(configured_path).expanduser().resolve()
+def _require_scene_path(scene_path: Path, profile_name: str) -> None:
     if not scene_path.is_file():
         raise FileNotFoundError(
-            f"UAV navigation scene not found at {scene_path}. "
-            "Set NAVRL_UAV_USD_SCENE or pass --load_scene."
+            f"UAV navigation scene profile '{profile_name}' not found at {scene_path}. "
+            "Set its profile-specific scene environment variable, set NAVRL_UAV_USD_SCENE, "
+            "or pass --load_scene."
         )
-    return scene_path
 
 
-UAV_NAVIGATION_SCENE_PATH = _resolve_scene_path()
+def configure_tilting_uav_physics_hz(env_cfg, physics_hz: float) -> tuple[float, float, int]:
+    """Set UAV physics frequency while preserving the configured policy cadence."""
+    requested_hz = float(physics_hz)
+    if not math.isfinite(requested_hz) or requested_hz <= 0.0:
+        raise ValueError(f"physics_hz must be finite and positive, got {physics_hz!r}.")
+
+    control_dt = float(env_cfg.sim.dt) * int(env_cfg.decimation)
+    if control_dt <= 0.0:
+        raise ValueError(f"Invalid existing control timestep: {control_dt!r}.")
+    control_hz = 1.0 / control_dt
+    decimation_float = requested_hz / control_hz
+    decimation = int(round(decimation_float))
+    if decimation < 1 or abs(decimation_float - decimation) > 1.0e-6:
+        raise ValueError(
+            f"physics_hz={requested_hz:g} must be an integer multiple of the "
+            f"policy rate {control_hz:g} Hz."
+        )
+
+    env_cfg.sim.dt = 1.0 / requested_hz
+    env_cfg.decimation = decimation
+    env_cfg.sim.render_interval = decimation
+    env_cfg.scene.lidar.update_period = decimation * env_cfg.sim.dt
+    contact_forces = getattr(env_cfg.scene, "contact_forces", None)
+    if contact_forces is not None:
+        contact_forces.update_period = env_cfg.sim.dt
+    if hasattr(env_cfg, "navigation_physics_hz"):
+        env_cfg.navigation_physics_hz = requested_hz
+    if hasattr(env_cfg, "navigation_control_hz"):
+        env_cfg.navigation_control_hz = control_hz
+    return requested_hz, control_hz, decimation
+
+
+UAV_NAVIGATION_SCENE_PATH = resolve_scene_path(GRID_8X8_PROFILE)
+UAV_WAREHOUSE_SCENE_PATH = resolve_scene_path(WAREHOUSE_100M_PROFILE)
 
 _UAV_NAVIGATION_CFG = TILTING_UAV_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 _UAV_NAVIGATION_CFG.init_state.pos = (0.0, 0.0, 1.5)
@@ -106,7 +133,7 @@ class TiltingUAVNavigationSceneCfg(InteractiveSceneCfg):
             channels=1,
             vertical_fov_range=(0.0, 0.0),
             horizontal_fov_range=(-180.0, 180.0),
-            horizontal_res=10.0,
+            horizontal_res=GRID_8X8_PROFILE.lidar_horizontal_res,
         ),
         max_distance=_LIDAR_RANGE,
         debug_vis=False,
@@ -126,11 +153,24 @@ class TiltingUAVNavigationSceneCfg(InteractiveSceneCfg):
     )
     dome_light = AssetBaseCfg(
         prim_path="/World/domeLight",
-        spawn=sim_utils.DomeLightCfg(color=(0.82, 0.85, 0.9), intensity=900.0),
+        spawn=sim_utils.DomeLightCfg(color=(0.82, 0.85, 0.9), intensity=300.0),
     )
+
+    # sun_light = AssetBaseCfg(
+    #     prim_path="/World/sunLight",
+    #     spawn=sim_utils.DistantLightCfg(color=(1.0, 0.95, 0.88), intensity=1800.0),
+    # )
     sun_light = AssetBaseCfg(
         prim_path="/World/sunLight",
-        spawn=sim_utils.DistantLightCfg(color=(1.0, 0.95, 0.88), intensity=1800.0),
+        spawn=sim_utils.DistantLightCfg(
+            color=(1.0, 0.95, 0.88),
+            intensity=1800.0,
+            angle=1.0,
+        ),
+        init_state=AssetBaseCfg.InitialStateCfg(
+            # XYZ 欧拉角约为 (0°, 45°, 45°)，四元数顺序是 wxyz
+            rot=(0.853553, -0.146447, 0.353553, 0.353553),
+        ),
     )
 
 
@@ -159,6 +199,7 @@ class ObservationsCfg:
                 "velocity_scale": 1.0,
                 "yaw_rate_scale": 1.0,
                 "max_distance": _LIDAR_RANGE,
+                "expected_rays": GRID_8X8_PROFILE.lidar_ray_count,
                 "debug_draw": True,
             },
         )
@@ -251,7 +292,12 @@ class TerminationsCfg:
     contact_collision = DoneTerm(func=uav_contact_collision, params={"threshold": 5.0})
     lidar_collision = DoneTerm(
         func=planar_lidar_collision,
-        params={"body_radius": 0.45, "max_distance": _LIDAR_RANGE, "k_nearest": 2},
+        params={
+            "body_radius": 0.45,
+            "max_distance": _LIDAR_RANGE,
+            "k_nearest": 2,
+            "expected_rays": GRID_8X8_PROFILE.lidar_ray_count,
+        },
     )
     altitude = DoneTerm(func=altitude_out_of_bounds, params={"max_error": 0.5})
     tilt = DoneTerm(func=excessive_tilt, params={"max_tilt": 0.5})
@@ -326,12 +372,29 @@ class TiltingUAVNavigationEnvCfg(ManagerBasedRLEnvCfg):
     terminations: TerminationsCfg = TerminationsCfg()
     events: EventCfg = EventCfg()
 
+    navigation_scene_profile: str = GRID_8X8_PROFILE.name
+    navigation_scene_layout: str = GRID_8X8_PROFILE.layout
+    navigation_scene_rows: int = GRID_8X8_PROFILE.rows
+    navigation_scene_columns: int = GRID_8X8_PROFILE.columns
+    navigation_cell_size: float = GRID_8X8_PROFILE.cell_size
+    navigation_scene_origin: tuple[float, float, float] = GRID_8X8_PROFILE.scene_origin
+    navigation_bounds_half_size: float = GRID_8X8_PROFILE.bounds_half_size
+    navigation_edge_offset: float = GRID_8X8_PROFILE.edge_offset
+    navigation_lateral_range: tuple[float, float] = GRID_8X8_PROFILE.lateral_range
+    navigation_evaluation_mode: str = GRID_8X8_PROFILE.evaluation_mode
+    navigation_curriculum_enabled: bool = GRID_8X8_PROFILE.curriculum
+    navigation_physics_hz: float = 400.0
+    navigation_control_hz: float = 10.0
+
     def __post_init__(self):
+        self._configure_common_runtime()
+        self._apply_scene_profile(GRID_8X8_PROFILE, UAV_NAVIGATION_SCENE_PATH)
+
+    def _configure_common_runtime(self) -> None:
         # Run flight physics at 400 Hz while preserving the 10 Hz policy and LiDAR period.
         self.sim.dt = 0.0025
         self.decimation = 40
         self.sim.render_interval = self.decimation
-        self.episode_length_s = 100.0
         self.scene.lidar.update_period = self.decimation * self.sim.dt
         self.scene.contact_forces.update_period = self.sim.dt
         self.viewer.origin_type = "env"
@@ -349,9 +412,83 @@ class TiltingUAVNavigationEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physx.gpu_heap_capacity = 2**28
         self.sim.physx.gpu_temp_buffer_capacity = 2**26
 
+    def _apply_scene_profile(
+        self,
+        profile: UavNavigationSceneProfile,
+        scene_path: Path,
+    ) -> None:
+        _require_scene_path(scene_path, profile.name)
+        self.navigation_scene_profile = profile.name
+        self.navigation_scene_layout = profile.layout
+        self.navigation_scene_rows = profile.rows
+        self.navigation_scene_columns = profile.columns
+        self.navigation_cell_size = profile.cell_size
+        self.navigation_scene_origin = profile.scene_origin
+        self.navigation_bounds_half_size = profile.bounds_half_size
+        self.navigation_edge_offset = profile.edge_offset
+        self.navigation_lateral_range = profile.lateral_range
+        self.navigation_evaluation_mode = profile.evaluation_mode
+        self.navigation_curriculum_enabled = profile.curriculum
+
+        self.scene.num_envs = profile.default_num_envs
+        self.scene.usd_scene.spawn.usd_path = str(scene_path)
+        self.scene.lidar.pattern_cfg.horizontal_res = profile.lidar_horizontal_res
+        self.episode_length_s = profile.episode_length_s
+        self.observations.policy.navigation.params["goal_distance_scale"] = (
+            profile.goal_distance_scale
+        )
+        self.observations.policy.navigation.params["expected_rays"] = profile.lidar_ray_count
+        self.observations.privileged.state.params.update(
+            {
+                "cell_size": profile.cell_size,
+                "num_rows": profile.rows,
+                "num_cols": profile.columns,
+                "include_scene_identity": profile.use_scene_identity,
+            }
+        )
+        self.terminations.out_of_bounds.params["half_size"] = profile.bounds_half_size
+        self.terminations.lidar_collision.params["expected_rays"] = profile.lidar_ray_count
+
+        if profile.layout == "grid":
+            self.events.setup_static_scene.func = setup_uav_static_usd_scene
+            self.events.setup_static_scene.params = {
+                "scene_root": _SCENE_ROOT,
+                "cell_size": profile.cell_size,
+                "num_rows": profile.rows,
+                "num_cols": profile.columns,
+                "grid_origin": profile.scene_origin,
+            }
+        else:
+            self.events.setup_static_scene.func = setup_uav_single_static_usd_scene
+            self.events.setup_static_scene.params = {
+                "scene_root": _SCENE_ROOT,
+                "scene_origin": profile.scene_origin,
+                "scene_size": profile.cell_size,
+            }
+
+
+@configclass
+class TiltingUAVWarehouseNavigationEnvCfg(TiltingUAVNavigationEnvCfg):
+    """Single 100 m warehouse scene with every UAV sharing the world origin."""
+
+    def __post_init__(self):
+        self._configure_common_runtime()
+        self._apply_scene_profile(WAREHOUSE_100M_PROFILE, UAV_WAREHOUSE_SCENE_PATH)
+        self.viewer.eye = (-35.0, -35.0, 30.0)
+        self.viewer.lookat = (0.0, 0.0, 1.5)
+
 
 @configclass
 class TiltingUAVNavigationEnvCfg_PLAY(TiltingUAVNavigationEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 8
+        self.commands.pose_command.debug_vis = True
+        self.scene.lidar.debug_vis = True
+
+
+@configclass
+class TiltingUAVWarehouseNavigationEnvCfg_PLAY(TiltingUAVWarehouseNavigationEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.num_envs = 8

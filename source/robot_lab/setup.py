@@ -19,6 +19,7 @@ INSTALL_REQUIRES = [
     "psutil",
     "colorama",
     "xacrodoc",
+    "pyyaml",
     # amp
     "numpy",
     "pandas",
@@ -37,6 +38,12 @@ setup(
     version=EXTENSION_TOML_DATA["package"]["version"],
     description=EXTENSION_TOML_DATA["package"]["description"],
     keywords=EXTENSION_TOML_DATA["package"]["keywords"],
+    package_data={
+        "robot_lab": [
+            "uav_nav.usda",
+            "tasks/manager_based/navigation/config/uav/*.yaml",
+        ]
+    },
     install_requires=INSTALL_REQUIRES,
     license="Apache License 2.0",
     include_package_data=True,

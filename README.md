@@ -14,6 +14,9 @@
 
 The table below lists all available environments:
 
+For the tilting-UAV navigation, evaluation, grasp handoff, and timing options,
+see [the handoff guide](docs/tilting_uav_navigation_handoff.md).
+
 | Category   | Robot Model         | Environment Name (<ENV_NAME>)                                      | Screenshot |
 |------------|---------------------|------------------------------------------------------------|------------|
 | **Quadruped** | [Anymal D](https://www.anybotics.com/robotics/anymal) | RobotLab-Isaac-Velocity-Rough-Anymal-D-v0 | <img src="./docs/imgs/anymal_d.png" alt="anymal_d" width="75"> |

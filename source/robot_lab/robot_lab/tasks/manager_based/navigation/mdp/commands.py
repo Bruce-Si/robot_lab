@@ -28,8 +28,11 @@ class NonStartEdgePose2dCommand(UniformPose2dCommand):
             edge = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         edge = edge[env_ids]
 
-        edge_offset = 22.0
-        lateral = torch.empty(num_envs, device=self.device).uniform_(-18.0, 18.0)
+        edge_offset = float(getattr(self._env.cfg, "navigation_edge_offset", 22.0))
+        lateral_range = tuple(
+            getattr(self._env.cfg, "navigation_lateral_range", (-18.0, 18.0))
+        )
+        lateral = torch.empty(num_envs, device=self.device).uniform_(*lateral_range)
         local_xy = torch.zeros(num_envs, 2, device=self.device)
 
         # Edge convention from reset: 0 left, 1 right, 2 bottom, 3 top.
@@ -90,3 +93,27 @@ class TargetFacingNonStartEdgePose2dCommand(NonStartEdgePose2dCommand):
             self.heading_command_w,
         )
         super()._update_command()
+
+
+class FixedLocalTargetFacingPose2dCommand(TargetFacingNonStartEdgePose2dCommand):
+    """Keep a target at one configured XY offset from each environment origin."""
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        if isinstance(env_ids, slice):
+            env_ids = torch.arange(self.num_envs, device=self.device)
+
+        target_local_xy = tuple(
+            getattr(self._env.cfg, "navigation_fixed_target_local_xy", (22.0, 0.0))
+        )
+        if len(target_local_xy) != 2:
+            raise ValueError(
+                "navigation_fixed_target_local_xy must contain exactly two values."
+            )
+
+        self.pos_command_w[env_ids] = self._env.scene.env_origins[env_ids]
+        self.pos_command_w[env_ids, 0] += float(target_local_xy[0])
+        self.pos_command_w[env_ids, 1] += float(target_local_xy[1])
+        self.pos_command_w[env_ids, 2] += self.robot.data.default_root_state[env_ids, 2]
+
+        target_vec = self.pos_command_w[env_ids] - self.robot.data.root_pos_w[env_ids]
+        self.heading_command_w[env_ids] = torch.atan2(target_vec[:, 1], target_vec[:, 0])

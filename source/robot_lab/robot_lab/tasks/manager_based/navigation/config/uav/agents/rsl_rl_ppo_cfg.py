@@ -47,3 +47,10 @@ class TiltingUAVNavPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class TiltingUAVWarehouseNavPPORunnerCfg(TiltingUAVNavPPORunnerCfg):
+    """PPO run namespace for the single-scene warehouse data-collection expert."""
+
+    experiment_name = "tilting_uav_warehouse_navrl_planar_yaw_oracle"

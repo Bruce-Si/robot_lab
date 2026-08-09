@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import traceback
 from pathlib import Path
 
 from isaaclab.app import AppLauncher
@@ -20,6 +21,20 @@ parser = argparse.ArgumentParser(description="Smoke-test planar UAV navigation i
 parser.add_argument("--num-envs", type=int, default=8)
 parser.add_argument("--hover-seconds", type=float, default=1.5)
 parser.add_argument("--command-seconds", type=float, default=1.0)
+parser.add_argument(
+    "--physics-hz",
+    "--physics_hz",
+    dest="physics_hz",
+    type=float,
+    default=400.0,
+    help="UAV physics frequency; default 400. Must be an integer multiple of the 10 Hz policy rate.",
+)
+parser.add_argument(
+    "--scene-profile",
+    choices=("grid_8x8", "warehouse_100m"),
+    default="grid_8x8",
+    help="Navigation scene profile and registered task to validate.",
+)
 parser.add_argument(
     "--keep-open",
     action="store_true",
@@ -41,12 +56,16 @@ import isaaclab.utils.math as math_utils
 import robot_lab.tasks  # noqa: F401
 from robot_lab.tasks.manager_based.navigation.config.uav.navigation_env_cfg import (
     TiltingUAVNavigationEnvCfg,
+    TiltingUAVWarehouseNavigationEnvCfg,
     UAV_NAVIGATION_SCENE_PATH,
+    UAV_WAREHOUSE_SCENE_PATH,
+    configure_tilting_uav_physics_hz,
 )
 from robot_lab.tasks.manager_based.navigation.mdp.uav_navigation import (
     PLANAR_LIDAR_RAY_COUNT,
     PLANAR_POLICY_STATE_DIM,
     UAV_PRIVILEGED_STATE_DIM,
+    UAV_SINGLE_SCENE_PRIVILEGED_STATE_DIM,
     goal_reached_with_heading,
     planar_lidar_distances,
 )
@@ -55,7 +74,16 @@ from robot_lab.tasks.manager_based.navigation.mdp.uav_velocity_action import (
 )
 
 
-TASK_ID = "RobotLab-Navigation-Tilting-UAV-v0"
+if args_cli.scene_profile == "warehouse_100m":
+    TASK_ID = "RobotLab-Navigation-Tilting-UAV-Warehouse-v0"
+    ENV_CFG_CLASS = TiltingUAVWarehouseNavigationEnvCfg
+    SCENE_PATH = UAV_WAREHOUSE_SCENE_PATH
+    EXPECTED_PRIVILEGED_DIM = UAV_SINGLE_SCENE_PRIVILEGED_STATE_DIM
+else:
+    TASK_ID = "RobotLab-Navigation-Tilting-UAV-v0"
+    ENV_CFG_CLASS = TiltingUAVNavigationEnvCfg
+    SCENE_PATH = UAV_NAVIGATION_SCENE_PATH
+    EXPECTED_PRIVILEGED_DIM = UAV_PRIVILEGED_STATE_DIM
 
 
 def run_smoke() -> dict[str, object]:
@@ -65,9 +93,10 @@ def run_smoke() -> dict[str, object]:
         raise ValueError("--keep-open requires a GUI run; remove --headless.")
     gym.spec(TASK_ID)
 
-    cfg = TiltingUAVNavigationEnvCfg()
+    cfg = ENV_CFG_CLASS()
     cfg.sim.device = args_cli.device
     cfg.scene.num_envs = args_cli.num_envs
+    timing = configure_tilting_uav_physics_hz(cfg, args_cli.physics_hz)
     cfg.scene.lidar.debug_vis = False
     cfg.commands.pose_command.debug_vis = False
     env = ManagerBasedRLEnv(cfg=cfg)
@@ -77,7 +106,7 @@ def run_smoke() -> dict[str, object]:
         privileged_obs = observations["privileged"]
         if policy_obs.shape != (env.num_envs, PLANAR_POLICY_STATE_DIM + PLANAR_LIDAR_RAY_COUNT):
             raise AssertionError(f"Unexpected policy observation shape: {policy_obs.shape}")
-        if privileged_obs.shape != (env.num_envs, UAV_PRIVILEGED_STATE_DIM):
+        if privileged_obs.shape != (env.num_envs, EXPECTED_PRIVILEGED_DIM):
             raise AssertionError(f"Unexpected privileged observation shape: {privileged_obs.shape}")
         if not torch.isfinite(policy_obs).all():
             raise AssertionError("Initial policy observations contain non-finite values.")
@@ -94,7 +123,9 @@ def run_smoke() -> dict[str, object]:
 
         lidar = env.scene.sensors["lidar"]
         if lidar.num_rays != PLANAR_LIDAR_RAY_COUNT:
-            raise AssertionError(f"Expected 36 LiDAR rays, got {lidar.num_rays}.")
+            raise AssertionError(
+                f"Expected {PLANAR_LIDAR_RAY_COUNT} LiDAR rays, got {lidar.num_rays}."
+            )
         local_directions = lidar.ray_directions[0]
         if torch.abs(local_directions[:, 2]).max().item() > 1.0e-6:
             raise AssertionError("The configured LiDAR contains a non-horizontal local ray.")
@@ -111,6 +142,12 @@ def run_smoke() -> dict[str, object]:
             raise AssertionError("No planar LiDAR ray hit the loaded static scene.")
 
         robot = env.scene["robot"]
+        if args_cli.scene_profile == "warehouse_100m":
+            expected_origin = torch.zeros_like(env.scene.env_origins)
+            if not torch.allclose(env.scene.env_origins, expected_origin, atol=1.0e-6):
+                raise AssertionError(
+                    f"Warehouse environment origins are not fixed at zero: {env.scene.env_origins}"
+                )
         if not torch.allclose(
             action_term.target_altitude,
             robot.data.root_pos_w[:, 2],
@@ -190,7 +227,7 @@ def run_smoke() -> dict[str, object]:
         command_term = env.command_manager.get_term("pose_command")
         pose_test_ids = torch.tensor((0, 1, 2), device=env.device, dtype=torch.long)
         test_bearings = robot.data.heading_w[pose_test_ids] + torch.tensor(
-            (math.radians(19.0), math.radians(21.0), 0.0), device=env.device
+            (math.radians(9.0), math.radians(11.0), 0.0), device=env.device
         )
         test_distances = torch.tensor((0.5, 0.5, 1.01), device=env.device)
         test_offsets = test_distances.unsqueeze(-1) * torch.stack(
@@ -202,7 +239,7 @@ def run_smoke() -> dict[str, object]:
         pose_success = goal_reached_with_heading(
             env,
             distance_threshold=1.0,
-            heading_threshold=math.radians(20.0),
+            heading_threshold=math.radians(10.0),
         )[pose_test_ids]
         expected_pose_success = torch.tensor((True, False, False), device=env.device)
         if not torch.equal(pose_success, expected_pose_success):
@@ -230,6 +267,7 @@ def run_smoke() -> dict[str, object]:
 
         return {
             "device": env.device,
+            "scene_profile": args_cli.scene_profile,
             "num_envs": env.num_envs,
             "physics_dt": env.physics_dt,
             "policy_dt": env.step_dt,
@@ -245,6 +283,9 @@ def run_smoke() -> dict[str, object]:
             "gripper_error_max_m": gripper_error.max().item(),
             "reward_range": (reward_min, reward_max),
             "reset_count": reset_count,
+            "physics_hz": timing[0],
+            "policy_hz": timing[1],
+            "decimation": timing[2],
         }
     finally:
         env.close()
@@ -255,8 +296,13 @@ def main() -> None:
     print("=" * 72)
     print("RobotLab Tilting UAV Planar Navigation Smoke Test: PASS")
     print(f"task={TASK_ID}")
-    print(f"scene={UAV_NAVIGATION_SCENE_PATH}")
+    print(f"scene_profile={result['scene_profile']}")
+    print(f"scene={SCENE_PATH}")
     print(f"device={result['device']} num_envs={result['num_envs']}")
+    print(
+        f"physics_hz={result['physics_hz']:g} policy_hz={result['policy_hz']:g} "
+        f"decimation={result['decimation']}"
+    )
     print(f"physics_dt={result['physics_dt']:.4f}s policy_dt={result['policy_dt']:.4f}s")
     print(f"observation_shape={result['observation_shape']} action_shape={result['action_shape']}")
     print(f"privileged_observation_shape={result['privileged_observation_shape']}")
@@ -268,13 +314,22 @@ def main() -> None:
     print(f"gripper_error_max_m={result['gripper_error_max_m']:.6f}")
     print(f"reward_range={result['reward_range']} reset_count={result['reset_count']}")
     print("partial_reset=ok")
-    print("goal_success=distance_lt_1.0m_and_abs_yaw_lt_20deg")
-    print("network=MLP actor_observation_dim=138 critic_observation_dim=138 action_dim=3")
+    print("goal_success=distance_lt_1.0m_and_abs_yaw_lt_10deg")
+    actor_observation_dim = policy_obs_dim = result["observation_shape"][1]
+    actor_observation_dim += result["privileged_observation_shape"][1]
+    print(
+        f"network=MLP policy_observation_dim={policy_obs_dim} "
+        f"actor_observation_dim={actor_observation_dim} "
+        f"critic_observation_dim={actor_observation_dim} action_dim=3"
+    )
     print("=" * 72)
 
 
 if __name__ == "__main__":
     try:
         main()
+    except Exception:
+        traceback.print_exc()
+        raise
     finally:
         simulation_app.close(wait_for_replicator=False)

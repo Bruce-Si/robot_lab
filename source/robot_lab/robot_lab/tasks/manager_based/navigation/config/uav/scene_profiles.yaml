@@ -1,0 +1,42 @@
+profiles:
+  grid_8x8:
+    layout: grid
+    usd_path: environments/loco_navi_curriculum_flat_v1_baked_round_prims.usd
+    scene_env_var: NAVRL_UAV_GRID_USD_SCENE
+    rows: 8
+    columns: 8
+    cell_size: 50.0
+    scene_origin: [0.0, 0.0, 0.0]
+    bounds_half_size: 25.0
+    goal_distance_scale: 50.0
+    start_goal_sampler: scene_edges
+    edge_offset: 22.0
+    lateral_range: [-18.0, 18.0]
+    episode_length_s: 100.0
+    default_num_envs: 64
+    curriculum: false
+    use_scene_identity: true
+    evaluation_mode: grid_cell
+    lidar_horizontal_res: 10.0
+    lidar_ray_count: 36
+
+  warehouse_100m:
+    layout: single
+    usd_path: environments/test.usd
+    scene_env_var: NAVRL_UAV_WAREHOUSE_USD_SCENE
+    rows: 1
+    columns: 1
+    cell_size: 100.0
+    scene_origin: [0.0, 0.0, 0.0]
+    bounds_half_size: 50.0
+    goal_distance_scale: 100.0
+    start_goal_sampler: scene_edges
+    edge_offset: 47.0
+    lateral_range: [-40.0, 40.0]
+    episode_length_s: 180.0
+    default_num_envs: 64
+    curriculum: false
+    use_scene_identity: false
+    evaluation_mode: single_scene
+    lidar_horizontal_res: 5.0
+    lidar_ray_count: 72

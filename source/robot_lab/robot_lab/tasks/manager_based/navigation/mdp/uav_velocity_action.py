@@ -103,6 +103,8 @@ class TiltingUAVVelocityAction(ActionTerm):
         self._last_angular_velocity_b = torch.zeros_like(self._processed_actions)
         self._attitude_derivative_lpf = torch.zeros_like(self._processed_actions)
         self._rate_derivative_lpf = torch.zeros_like(self._processed_actions)
+        self._target_roll = torch.zeros(self.num_envs, device=self.device)
+        self._target_pitch = torch.zeros(self.num_envs, device=self.device)
         self._target_yaw = torch.zeros(self.num_envs, device=self.device)
         self._target_altitude = torch.zeros(self.num_envs, device=self.device)
 
@@ -135,6 +137,11 @@ class TiltingUAVVelocityAction(ActionTerm):
     @property
     def velocity_command_target(self) -> torch.Tensor:
         return self._velocity_command_target
+
+    @property
+    def velocity_scale(self) -> torch.Tensor:
+        """Per-axis conversion from normalized actions to velocity commands."""
+        return self._velocity_scale
 
     @property
     def yaw_rate_command_target(self) -> torch.Tensor:
@@ -184,12 +191,57 @@ class TiltingUAVVelocityAction(ActionTerm):
         return self._target_yaw
 
     @property
+    def target_roll(self) -> torch.Tensor:
+        """Current roll target used by the attitude controller."""
+        return self._target_roll
+
+    @property
+    def target_pitch(self) -> torch.Tensor:
+        """Current pitch target used by the attitude controller."""
+        return self._target_pitch
+
+    @property
     def target_altitude(self) -> torch.Tensor:
         return self._target_altitude
 
     @property
     def velocity_integral_error(self) -> torch.Tensor:
         return self._velocity_integral_error
+
+    def set_target_altitude(self, altitude: float, env_ids: Sequence[int] | None = None) -> None:
+        """Set the outer-loop altitude target for a scripted task handoff."""
+        ids = self._resolve_env_ids(env_ids)
+        self._target_altitude[ids] = float(altitude)
+
+    def set_target_attitude(
+        self,
+        *,
+        roll: float = 0.0,
+        pitch: float = 0.0,
+        env_ids: Sequence[int] | None = None,
+    ) -> None:
+        """Set roll/pitch targets while retaining the policy-controlled yaw target."""
+        ids = self._resolve_env_ids(env_ids)
+        self._target_roll[ids] = float(roll)
+        self._target_pitch[ids] = float(pitch)
+
+    def set_gripper_close_fraction(
+        self,
+        fraction: float,
+        env_ids: Sequence[int] | None = None,
+    ) -> None:
+        """Set a normalized gripper command for a scripted grasp phase.
+
+        ``fraction=0`` uses the authored open positions and ``fraction=1`` uses
+        the configured closed positions. Navigation policies leave this at zero.
+        """
+        ids = self._resolve_env_ids(env_ids)
+        close_fraction = float(max(0.0, min(1.0, fraction)))
+        open_positions = self._asset.data.default_joint_pos[ids[:, None], self._gripper_joint_ids]
+        closed_positions = self._tensor(self.cfg.gripper_closed_positions).expand(ids.numel(), -1)
+        self._gripper_position_target[ids] = open_positions + close_fraction * (
+            closed_positions - open_positions
+        )
 
     def process_actions(self, actions: torch.Tensor) -> None:
         if actions.shape != self._raw_actions.shape:
@@ -305,6 +357,8 @@ class TiltingUAVVelocityAction(ActionTerm):
         self._rate_derivative_lpf[env_ids_tensor] = 0.0
 
         _, _, yaw = math_utils.euler_xyz_from_quat(self._asset.data.root_quat_w[env_ids_tensor])
+        self._target_roll[env_ids_tensor] = 0.0
+        self._target_pitch[env_ids_tensor] = 0.0
         self._target_yaw[env_ids_tensor] = yaw
         self._target_altitude[env_ids_tensor] = self._asset.data.root_pos_w[env_ids_tensor, 2]
 
@@ -333,8 +387,11 @@ class TiltingUAVVelocityAction(ActionTerm):
     def _compute_attitude_torque(
         self, root_quat_w: torch.Tensor, root_ang_vel_b: torch.Tensor
     ) -> torch.Tensor:
-        zeros = torch.zeros_like(self._target_yaw)
-        target_quat_w = math_utils.quat_from_euler_xyz(zeros, zeros, self._target_yaw)
+        target_quat_w = math_utils.quat_from_euler_xyz(
+            self._target_roll,
+            self._target_pitch,
+            self._target_yaw,
+        )
         attitude_error_quat = math_utils.quat_mul(math_utils.quat_conjugate(root_quat_w), target_quat_w)
         attitude_error = math_utils.axis_angle_from_quat(attitude_error_quat)
 
@@ -530,3 +587,4 @@ class TiltingUAVVelocityActionCfg(ActionTermCfg):
         "left_left_finger",
         "left_right_finger",
     )
+    gripper_closed_positions: tuple[float, float] = (0.0, 0.0)

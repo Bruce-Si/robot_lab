@@ -23,6 +23,7 @@ def reset_root_state_uniform_navigation(
     env_ids: torch.Tensor,
     pose_range: dict[str, tuple[float, float]],
     velocity_range: dict[str, tuple[float, float]],
+    start_edge: int | None = None,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ):
     """Reset robot root state on a random cell edge.
@@ -46,11 +47,21 @@ def reset_root_state_uniform_navigation(
     if not hasattr(env, "_nav_start_edge"):
         env._nav_start_edge = torch.zeros(env.num_envs, device=asset.device, dtype=torch.long)
 
-    edge = torch.randint(0, 4, (num_resets,), device=asset.device)
+    if start_edge is None:
+        edge = torch.randint(0, 4, (num_resets,), device=asset.device)
+    else:
+        if not 0 <= int(start_edge) <= 3:
+            raise ValueError(f"start_edge must be in [0, 3], got {start_edge}.")
+        edge = torch.full(
+            (num_resets,),
+            int(start_edge),
+            device=asset.device,
+            dtype=torch.long,
+        )
     env._nav_start_edge[env_ids] = edge
 
-    edge_offset = 22.0
-    lateral_range = (-18.0, 18.0)
+    edge_offset = float(getattr(env.cfg, "navigation_edge_offset", 22.0))
+    lateral_range = tuple(getattr(env.cfg, "navigation_lateral_range", (-18.0, 18.0)))
     lateral = torch.empty(num_resets, device=asset.device).uniform_(*lateral_range)
 
     local_xy = torch.zeros(num_resets, 2, device=asset.device)

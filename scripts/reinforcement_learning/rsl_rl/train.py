@@ -18,6 +18,11 @@ from isaaclab.app import AppLauncher
 # local imports
 import cli_args  # isort: skip
 
+
+UAV_GRID_TASK = "RobotLab-Navigation-Tilting-UAV-v0"
+UAV_WAREHOUSE_TASK = "RobotLab-Navigation-Tilting-UAV-Warehouse-v0"
+UAV_NAVIGATION_TASKS = {UAV_GRID_TASK, UAV_WAREHOUSE_TASK}
+
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
@@ -31,6 +36,14 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
+    "--physics-hz",
+    "--physics_hz",
+    dest="physics_hz",
+    type=float,
+    default=400.0,
+    help="UAV physics frequency; default 400. Must be an integer multiple of the 10 Hz policy rate.",
+)
+parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
@@ -41,8 +54,12 @@ parser.add_argument(
     default=0,
     help="Run deterministic UAV evaluation every N learning iterations; zero disables it.",
 )
-parser.add_argument("--eval_level", type=int, default=7, help="USD grid row used for periodic UAV evaluation.")
-parser.add_argument("--eval_variant", type=int, default=7, help="USD grid column used for periodic UAV evaluation.")
+parser.add_argument(
+    "--eval_level", type=int, default=7, help="USD grid row used for periodic 8-by-8 UAV evaluation."
+)
+parser.add_argument(
+    "--eval_variant", type=int, default=7, help="USD grid column used for periodic 8-by-8 UAV evaluation."
+)
 parser.add_argument("--eval_seed", type=int, default=42, help="Fixed seed used for comparable periodic evaluations.")
 parser.add_argument(
     "--eval_episodes_per_env", type=int, default=1, help="Completed evaluation episodes per environment."
@@ -63,12 +80,11 @@ if args_cli.task is None:
     )
 if args_cli.eval_interval < 0:
     parser.error("--eval_interval cannot be negative.")
-if not 0 <= args_cli.eval_level < 8:
-    parser.error("--eval_level must be in [0, 7].")
-if not 0 <= args_cli.eval_variant < 8:
-    parser.error("--eval_variant must be in [0, 7].")
 if args_cli.eval_episodes_per_env <= 0:
     parser.error("--eval_episodes_per_env must be positive.")
+task_id = args_cli.task.split(":")[-1]
+if args_cli.eval_interval > 0 and task_id not in UAV_NAVIGATION_TASKS:
+    parser.error("--eval_interval is implemented only for the registered tilting-UAV navigation tasks.")
 
 # Pass USD scene path via env var before hydra loads config
 if args_cli.load_scene:
@@ -139,6 +155,10 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import robot_lab.tasks  # noqa: F401  # isort: skip
 
+from robot_lab.tasks.manager_based.navigation.config.uav.navigation_env_cfg import (
+    configure_tilting_uav_physics_hz,
+)
+
 from uav_navigation_eval import (  # isort: skip
     PeriodicEvaluationOnPolicyRunner,
     evaluate_uav_navigation,
@@ -164,6 +184,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    if task_id in UAV_NAVIGATION_TASKS:
+        physics_hz, control_hz, decimation = configure_tilting_uav_physics_hz(
+            env_cfg, args_cli.physics_hz
+        )
+        print(
+            f"[INFO] UAV timing: physics={physics_hz:g} Hz, "
+            f"policy={control_hz:g} Hz, decimation={decimation}."
+        )
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
@@ -195,10 +223,32 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.eval_interval > 0:
         if args_cli.distributed:
             raise ValueError("Periodic UAV evaluation currently supports single-process training only.")
-        if args_cli.task.split(":")[-1] != "RobotLab-Navigation-Tilting-UAV-v0":
-            raise ValueError("--eval_interval is currently implemented only for the tilting-UAV navigation task.")
         if agent_cfg.class_name != "OnPolicyRunner":
             raise ValueError("Periodic UAV evaluation requires an OnPolicyRunner agent.")
+
+    eval_scene_layout = getattr(env_cfg, "navigation_scene_layout", None)
+    eval_scene_profile = getattr(env_cfg, "navigation_scene_profile", None)
+    eval_cell_index = None
+    eval_scene_label = f"scene={eval_scene_profile}"
+    eval_output_tag = f"scene_{eval_scene_profile}"
+    if args_cli.eval_interval > 0:
+        if eval_scene_layout == "grid":
+            num_rows = int(env_cfg.navigation_scene_rows)
+            num_cols = int(env_cfg.navigation_scene_columns)
+            if not 0 <= args_cli.eval_level < num_rows:
+                raise ValueError(f"--eval_level must be in [0, {num_rows - 1}] for {eval_scene_profile}.")
+            if not 0 <= args_cli.eval_variant < num_cols:
+                raise ValueError(f"--eval_variant must be in [0, {num_cols - 1}] for {eval_scene_profile}.")
+            eval_cell_index = args_cli.eval_level * num_cols + args_cli.eval_variant
+            eval_scene_label = (
+                f"cell={eval_cell_index} "
+                f"(level={args_cli.eval_level}, variant={args_cli.eval_variant})"
+            )
+            eval_output_tag = f"cell_{eval_cell_index:02d}"
+        elif eval_scene_layout != "single":
+            raise ValueError(
+                f"Unsupported UAV navigation scene layout for periodic evaluation: {eval_scene_layout!r}."
+            )
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -252,8 +302,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-    eval_cell_index = args_cli.eval_level * 8 + args_cli.eval_variant
-
     def run_periodic_evaluation(eval_runner: OnPolicyRunner, iteration: int) -> None:
         checkpoint_path = os.path.join(log_dir, f"model_{iteration}.pt")
         if iteration % eval_runner.cfg["save_interval"] != 0 or not os.path.isfile(checkpoint_path):
@@ -261,7 +309,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         print(
             f"[INFO] Starting deterministic UAV evaluation at iteration {iteration}: "
-            f"cell={eval_cell_index} (level={args_cli.eval_level}, variant={args_cli.eval_variant}), "
+            f"{eval_scene_label}, "
             f"envs={env.num_envs}, episodes_per_env={args_cli.eval_episodes_per_env}."
         )
         policy = eval_runner.get_inference_policy(device=env.unwrapped.device)
@@ -281,7 +329,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             os.path.join(
                 log_dir,
                 "evaluations",
-                f"iteration_{iteration:06d}_cell_{eval_cell_index:02d}.json",
+                f"iteration_{iteration:06d}_{eval_output_tag}.json",
             ),
         )
         log_evaluation_scalars(eval_runner.logger.writer, result, iteration)
@@ -320,7 +368,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.eval_interval > 0:
         print(
             f"[INFO] Periodic UAV evaluation enabled: interval={args_cli.eval_interval}, "
-            f"cell={eval_cell_index}, seed={args_cli.eval_seed}, "
+            f"{eval_scene_label}, seed={args_cli.eval_seed}, "
             f"episodes_per_env={args_cli.eval_episodes_per_env}."
         )
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)

@@ -14,16 +14,7 @@ from isaaclab.assets import ArticulationCfg
 TILTING_UAV_USD_ENV_VAR = "ROBOT_LAB_TILTING_UAV_USD"
 """Environment variable that overrides the derived tilting-UAV USD path."""
 
-_DEFAULT_TILTING_UAV_USD_PATH = (
-    Path(__file__).resolve().parents[5]
-    / "TiltingUAV_Sim"
-    / "TiltingUAV_Diffusion"
-    / "TiltingUAV_Isaac"
-    / "assets"
-    / "uav_mesh"
-    / "robotlab"
-    / "uav_nav.usda"
-)
+_DEFAULT_TILTING_UAV_USD_PATH = Path(__file__).with_name("uav_nav.usda").resolve()
 
 
 def _resolve_tilting_uav_usd_path() -> Path:
@@ -84,10 +75,13 @@ TILTING_UAV_CFG = ArticulationCfg(
         ),
         "gripper": ImplicitActuatorCfg(
             joint_names_expr=["left_(left|right)_finger"],
-            effort_limit_sim=5.0,
-            velocity_limit_sim=0.25,
-            stiffness=400.0,
-            damping=40.0,
+            # Match TiltingUAV_Isaac GripperPhysics' linear drive:
+            # stiffness=1e4, damping=1e3, max force=50 N. Let PhysX use
+            # the authored USD velocity limit instead of imposing 0.25 m/s.
+            effort_limit_sim=50.0,
+            velocity_limit_sim=None,
+            stiffness=1.0e4,
+            damping=1.0e3,
         ),
     },
 )

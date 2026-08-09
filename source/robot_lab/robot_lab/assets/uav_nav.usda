@@ -1,0 +1,129 @@
+#usda 1.0
+(
+    defaultPrim = "tiltinguav_visual"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+# RobotLab/Isaac Lab compatibility layer.
+#
+# The source asset remains read-only. This layer references the original
+# uav.usd and only overrides metadata needed by one floating articulation:
+#   - keep base_link as the only articulation root;
+#   - disable the gripper's duplicate world-fixed root joint;
+#   - turn rotor spin joints into fixed joints (visual spin is handled in code);
+#   - restore the missing revolute-axis token on the four tilt joints;
+#   - make the authored rigid-body masses sum to the controller's 2.43 kg.
+def Xform "tiltinguav_visual" (
+    prepend references = @../../../../../TiltingUAV_Sim/TiltingUAV_Diffusion/TiltingUAV_Isaac/assets/uav_mesh/uav.usd@</tiltinguav_visual>
+)
+{
+    over "base_link"
+    {
+        # Source total: 2.5052 kg. All non-base bodies total 0.5752 kg.
+        # Scaling the original 1.93 kg base to 1.8548 kg gives 2.43 kg total.
+        float physics:mass = 1.8548
+        float3 physics:diagonalInertia = (0.00331510, 0.01072090, 0.01003090)
+    }
+
+    over "joints" (
+        delete apiSchemas = ["PhysicsArticulationRootAPI", "PhysxArticulationAPI"]
+    )
+    {
+        # The URDF converter encoded each arbitrary horizontal tilt axis in
+        # physics:localRot*, but left physics:axis empty. X is the intended
+        # canonical joint axis after those local rotations are applied.
+        def PhysicsRevoluteJoint "joint_arm_1"
+        {
+            uniform token physics:axis = "X"
+            float physics:lowerLimit = -180
+            float physics:upperLimit = 180
+        }
+
+        def PhysicsRevoluteJoint "joint_arm_2"
+        {
+            uniform token physics:axis = "X"
+            float physics:lowerLimit = -180
+            float physics:upperLimit = 180
+        }
+
+        def PhysicsRevoluteJoint "joint_arm_3"
+        {
+            uniform token physics:axis = "X"
+            float physics:lowerLimit = -180
+            float physics:upperLimit = 180
+        }
+
+        def PhysicsRevoluteJoint "joint_arm_4"
+        {
+            uniform token physics:axis = "X"
+            float physics:lowerLimit = -180
+            float physics:upperLimit = 180
+        }
+
+        # Rotor thrust is applied through the root wrench; rotor spin remains
+        # an optional visual effect instead of an articulation action.
+        def PhysicsFixedJoint "joint_down_rotor_1" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular"]
+        )
+        {
+        }
+
+        def PhysicsFixedJoint "joint_up_rotor_1" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular"]
+        )
+        {
+        }
+
+        def PhysicsFixedJoint "joint_down_rotor_2" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular"]
+        )
+        {
+        }
+
+        def PhysicsFixedJoint "joint_up_rotor_2" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular"]
+        )
+        {
+        }
+
+        def PhysicsFixedJoint "joint_down_rotor_3" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular"]
+        )
+        {
+        }
+
+        def PhysicsFixedJoint "joint_up_rotor_3" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular"]
+        )
+        {
+        }
+
+        def PhysicsFixedJoint "joint_down_rotor_4" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular"]
+        )
+        {
+        }
+
+        def PhysicsFixedJoint "joint_up_rotor_4" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular"]
+        )
+        {
+        }
+    }
+
+    over "gripper"
+    {
+        over "single_gripper"
+        {
+            # The source joint has no body0 and would fix the gripper to the
+            # world. gripper_fixed_baselink already connects it to the UAV.
+            over "root_joint" (
+                active = false
+                delete apiSchemas = ["PhysicsArticulationRootAPI", "PhysxArticulationAPI"]
+            )
+            {
+            }
+        }
+    }
+}

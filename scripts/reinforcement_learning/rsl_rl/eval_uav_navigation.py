@@ -18,6 +18,9 @@ import cli_args  # isort: skip
 
 ROBOT_LAB_ROOT = Path(__file__).resolve().parents[3]
 ENVIRONMENT_ASSET_DIR = ROBOT_LAB_ROOT / "source/robot_lab/data/environments"
+UAV_GRID_TASK = "RobotLab-Navigation-Tilting-UAV-v0"
+UAV_WAREHOUSE_TASK = "RobotLab-Navigation-Tilting-UAV-Warehouse-v0"
+UAV_NAVIGATION_TASKS = {UAV_GRID_TASK, UAV_WAREHOUSE_TASK}
 
 parser = argparse.ArgumentParser(description="Evaluate a tilting-UAV navigation checkpoint.")
 parser.add_argument("--num_envs", type=int, default=1024, help="Number of parallel evaluation UAVs.")
@@ -35,11 +38,19 @@ parser.add_argument("--load_scene", type=str, default=None, help="Path to an exp
 parser.add_argument(
     "--full_grid_scene",
     action="store_true",
-    help="Load the original 8-by-8 scene instead of the derived single-cell scene.",
+    help="For the grid task, load the original 8-by-8 scene instead of an extracted cell.",
 )
-parser.add_argument("--terrain_level", type=int, default=7, help="USD grid row to evaluate.")
-parser.add_argument("--terrain_variant", type=int, default=7, help="USD grid column to evaluate.")
+parser.add_argument("--terrain_level", type=int, default=7, help="8-by-8 USD grid row to evaluate.")
+parser.add_argument("--terrain_variant", type=int, default=7, help="8-by-8 USD grid column to evaluate.")
 parser.add_argument("--episodes_per_env", type=int, default=1, help="Completed episodes to collect per UAV.")
+parser.add_argument(
+    "--physics-hz",
+    "--physics_hz",
+    dest="physics_hz",
+    type=float,
+    default=400.0,
+    help="UAV physics frequency; default 400. Must be an integer multiple of the 10 Hz policy rate.",
+)
 parser.add_argument("--output", type=str, default=None, help="Optional evaluation JSON path.")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -49,34 +60,56 @@ if args_cli.checkpoint is None:
     parser.error("--checkpoint is required.")
 if args_cli.num_envs <= 0:
     parser.error("--num_envs must be positive.")
-if not 0 <= args_cli.terrain_level < 8:
-    parser.error("--terrain_level must be in [0, 7].")
-if not 0 <= args_cli.terrain_variant < 8:
-    parser.error("--terrain_variant must be in [0, 7].")
 if args_cli.episodes_per_env <= 0:
     parser.error("--episodes_per_env must be positive.")
-if args_cli.full_grid_scene and args_cli.load_scene:
-    parser.error("--full_grid_scene and --load_scene cannot be used together.")
+task_id = args_cli.task.split(":")[-1]
+if task_id not in UAV_NAVIGATION_TASKS:
+    parser.error(f"This evaluator supports only these tasks: {sorted(UAV_NAVIGATION_TASKS)}")
 
-if not args_cli.full_grid_scene and args_cli.load_scene is None:
-    single_cell_scene = (
-        ENVIRONMENT_ASSET_DIR
-        / f"uav_eval_cell_{args_cli.terrain_level}_{args_cli.terrain_variant}_baked_round_prims.usd"
-    )
-    if not single_cell_scene.is_file():
-        parser.error(
-            f"Derived single-cell scene not found: {single_cell_scene}. "
-            "Generate it with scripts/tools/extract_navrl_usd_cell.py or pass --full_grid_scene."
+is_grid_task = task_id == UAV_GRID_TASK
+explicit_scene_override = args_cli.load_scene is not None
+if is_grid_task:
+    if not 0 <= args_cli.terrain_level < 8:
+        parser.error("--terrain_level must be in [0, 7].")
+    if not 0 <= args_cli.terrain_variant < 8:
+        parser.error("--terrain_variant must be in [0, 7].")
+    if args_cli.full_grid_scene and explicit_scene_override:
+        parser.error("--full_grid_scene and --load_scene cannot be used together.")
+    if not args_cli.full_grid_scene and not explicit_scene_override:
+        single_cell_scene = (
+            ENVIRONMENT_ASSET_DIR
+            / f"uav_eval_cell_{args_cli.terrain_level}_{args_cli.terrain_variant}_baked_round_prims.usd"
         )
-    args_cli.load_scene = str(single_cell_scene)
+        if not single_cell_scene.is_file():
+            parser.error(
+                f"Derived single-cell scene not found: {single_cell_scene}. "
+                "Generate it with scripts/tools/extract_navrl_usd_cell.py or pass --full_grid_scene."
+            )
+        args_cli.load_scene = str(single_cell_scene)
+        scene_source_mode = "extracted_grid_cell"
+    elif args_cli.full_grid_scene:
+        scene_source_mode = "full_grid"
+    else:
+        scene_source_mode = "explicit_grid_scene"
+else:
+    if args_cli.full_grid_scene:
+        parser.error("--full_grid_scene applies only to RobotLab-Navigation-Tilting-UAV-v0.")
+    scene_source_mode = "explicit_single_scene" if explicit_scene_override else "profile_single_scene"
 
 if args_cli.load_scene is not None:
-    scene_path = str(Path(args_cli.load_scene).expanduser().resolve())
+    resolved_scene_path = Path(args_cli.load_scene).expanduser().resolve()
+    if not resolved_scene_path.is_file():
+        parser.error(f"Navigation scene not found: {resolved_scene_path}")
+    scene_path = str(resolved_scene_path)
+    profile_scene_env = "NAVRL_UAV_GRID_USD_SCENE" if is_grid_task else "NAVRL_UAV_WAREHOUSE_USD_SCENE"
+    os.environ[profile_scene_env] = scene_path
     os.environ["NAVRL_UAV_USD_SCENE"] = scene_path
     os.environ["NAVRL_USD_SCENE"] = scene_path
     print(f"[INFO] Using selected navigation scene: {scene_path}")
-else:
+elif is_grid_task:
     print("[INFO] Using the configured full-grid navigation scene.")
+else:
+    print("[INFO] Using the configured warehouse_100m single scene.")
 
 sys.argv = [sys.argv[0]] + hydra_args
 app_launcher = AppLauncher(args_cli)
@@ -97,6 +130,10 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import robot_lab.tasks  # noqa: F401  # isort: skip
 
+from robot_lab.tasks.manager_based.navigation.config.uav.navigation_env_cfg import (
+    configure_tilting_uav_physics_hz,
+)
+
 from uav_navigation_eval import (  # isort: skip
     evaluate_uav_navigation,
     print_evaluation_summary,
@@ -115,6 +152,14 @@ def main(env_cfg, agent_cfg: RslRlBaseRunnerCfg):
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
     env_cfg.scene.num_envs = args_cli.num_envs
+    if task_id in UAV_NAVIGATION_TASKS:
+        physics_hz, control_hz, decimation = configure_tilting_uav_physics_hz(
+            env_cfg, args_cli.physics_hz
+        )
+        print(
+            f"[INFO] UAV timing: physics={physics_hz:g} Hz, "
+            f"policy={control_hz:g} Hz, decimation={decimation}."
+        )
     env_cfg.seed = agent_cfg.seed
     if args_cli.device is not None:
         env_cfg.sim.device = args_cli.device
@@ -136,7 +181,14 @@ def main(env_cfg, agent_cfg: RslRlBaseRunnerCfg):
         runner.load(str(checkpoint_path))
         policy = runner.get_inference_policy(device=env.unwrapped.device)
 
-        cell_index = args_cli.terrain_level * 8 + args_cli.terrain_variant
+        scene_layout = env.unwrapped.cfg.navigation_scene_layout
+        if scene_layout == "grid":
+            num_cols = int(env.unwrapped.cfg.navigation_scene_columns)
+            cell_index = args_cli.terrain_level * num_cols + args_cli.terrain_variant
+        elif scene_layout == "single":
+            cell_index = None
+        else:
+            raise ValueError(f"Unsupported UAV navigation scene layout: {scene_layout!r}")
         result = evaluate_uav_navigation(
             env,
             policy,
@@ -147,18 +199,31 @@ def main(env_cfg, agent_cfg: RslRlBaseRunnerCfg):
         result["task"] = args_cli.task
         result["checkpoint"] = str(checkpoint_path)
         result["checkpoint_iteration"] = runner.current_learning_iteration
-        result["scene_mode"] = "full_grid" if args_cli.full_grid_scene else "single_cell"
+        result["scene_mode"] = (
+            "single_scene"
+            if scene_layout == "single"
+            else ("full_grid" if args_cli.full_grid_scene else "single_cell")
+        )
+        result["scene_source_mode"] = scene_source_mode
         result["scene_usd"] = str(env.unwrapped.cfg.scene.usd_scene.spawn.usd_path)
 
         if args_cli.output:
             output_path = Path(args_cli.output)
-        else:
-            scene_tag = "full_grid" if args_cli.full_grid_scene else "single"
+        elif scene_layout == "grid":
             output_path = (
                 checkpoint_path.parent
                 / "evaluations"
                 / (
-                    f"{checkpoint_path.stem}_{scene_tag}_cell_{cell_index:02d}_seed_{args_cli.seed}"
+                    f"{checkpoint_path.stem}_{scene_source_mode}_cell_{cell_index:02d}_seed_{args_cli.seed}"
+                    f"_episodes_{args_cli.episodes_per_env}.json"
+                )
+            )
+        else:
+            output_path = (
+                checkpoint_path.parent
+                / "evaluations"
+                / (
+                    f"{checkpoint_path.stem}_{env.unwrapped.cfg.navigation_scene_profile}_seed_{args_cli.seed}"
                     f"_episodes_{args_cli.episodes_per_env}.json"
                 )
             )

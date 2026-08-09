@@ -19,7 +19,10 @@ import torch
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.utils import check_nan
 
-from robot_lab.tasks.manager_based.navigation.mdp.uav_navigation import set_uav_navigation_cells
+from robot_lab.tasks.manager_based.navigation.mdp.uav_navigation import (
+    set_uav_navigation_cells,
+    set_uav_navigation_scene_origin,
+)
 
 
 EDGE_NAMES = ("left", "right", "bottom", "top")
@@ -90,7 +93,7 @@ def evaluate_uav_navigation(
     env,
     policy,
     *,
-    cell_index: int,
+    cell_index: int | None,
     episodes_per_env: int = 1,
     seed: int = 42,
     cell_size: float = 50.0,
@@ -99,7 +102,7 @@ def evaluate_uav_navigation(
     restore_training_cells: bool = False,
     progress_interval_steps: int = 100,
 ) -> dict[str, Any]:
-    """Run deterministic episodes with every environment in one USD scene cell.
+    """Run deterministic episodes in a grid cell or one fixed shared scene.
 
     Isaac Lab resets completed environments inside ``step``. Termination signals,
     start edges, and goal edges are therefore captured for the just-completed
@@ -107,22 +110,47 @@ def evaluate_uav_navigation(
     """
     if episodes_per_env <= 0:
         raise ValueError("episodes_per_env must be positive.")
-    num_cells = num_rows * num_cols
-    if cell_index < 0 or cell_index >= num_cells:
-        raise ValueError(f"cell_index must be in [0, {num_cells - 1}], got {cell_index}.")
-
     raw_env = env.unwrapped
     if not hasattr(raw_env, "termination_manager"):
         raise TypeError("UAV evaluation requires a ManagerBasedRLEnv termination manager.")
+    scene_layout = getattr(raw_env.cfg, "navigation_scene_layout", "grid")
+    scene_profile = getattr(raw_env.cfg, "navigation_scene_profile", "grid_8x8")
+    evaluation_mode = getattr(
+        raw_env.cfg,
+        "navigation_evaluation_mode",
+        "grid_cell" if scene_layout == "grid" else "single_scene",
+    )
+    cell_size = float(getattr(raw_env.cfg, "navigation_cell_size", cell_size))
+    num_rows = int(getattr(raw_env.cfg, "navigation_scene_rows", num_rows))
+    num_cols = int(getattr(raw_env.cfg, "navigation_scene_columns", num_cols))
+    scene_origin = tuple(
+        float(value)
+        for value in getattr(raw_env.cfg, "navigation_scene_origin", (0.0, 0.0, 0.0))
+    )
+    if scene_layout == "grid":
+        num_cells = num_rows * num_cols
+        if cell_index is None or cell_index < 0 or cell_index >= num_cells:
+            raise ValueError(
+                f"cell_index must be in [0, {num_cells - 1}] for grid evaluation, "
+                f"got {cell_index}."
+            )
+    elif scene_layout == "single":
+        if cell_index not in (None, 0):
+            raise ValueError(f"Single-scene evaluation does not accept cell_index={cell_index}.")
+        cell_index = None
+    else:
+        raise ValueError(f"Unsupported UAV navigation scene layout: {scene_layout}")
+
     missing_terms = set(TERMINATION_TERMS) - set(raw_env.termination_manager.active_terms)
     if missing_terms:
         raise ValueError(f"UAV evaluation termination terms are missing: {sorted(missing_terms)}")
 
     original_cells = getattr(raw_env, "_uav_navigation_cell_index", None)
     if restore_training_cells:
-        if original_cells is None:
+        if scene_layout == "grid" and original_cells is None:
             raise RuntimeError("Training cell mapping is unavailable and cannot be restored after evaluation.")
-        original_cells = original_cells.clone()
+        if original_cells is not None:
+            original_cells = original_cells.clone()
         rng_state = _capture_rng_state()
     else:
         rng_state = None
@@ -148,13 +176,17 @@ def evaluate_uav_navigation(
     wall_start = time.time()
     try:
         _seed_evaluation(seed)
-        set_uav_navigation_cells(
-            raw_env,
-            cell_indices=cell_index,
-            cell_size=cell_size,
-            num_rows=num_rows,
-            num_cols=num_cols,
-        )
+        if scene_layout == "grid":
+            set_uav_navigation_cells(
+                raw_env,
+                cell_indices=cell_index,
+                cell_size=cell_size,
+                num_rows=num_rows,
+                num_cols=num_cols,
+                grid_origin=scene_origin,
+            )
+        else:
+            set_uav_navigation_scene_origin(raw_env, scene_origin=scene_origin)
         with torch.inference_mode():
             obs, _ = env.reset()
             policy.reset(torch.ones(num_envs, device=device, dtype=torch.bool))
@@ -163,6 +195,7 @@ def evaluate_uav_navigation(
             raise RuntimeError("Navigation start/goal edge buffers were not created during reset.")
 
         max_rollout_steps = int(env.max_episode_length) * episodes_per_env
+        scene_label = f"cell={cell_index}" if scene_layout == "grid" else f"scene={scene_profile}"
         while completed_trials < total_trials and rollout_steps < max_rollout_steps:
             active = episode_counts < episodes_per_env
             start_edges = raw_env._nav_start_edge.clone()
@@ -229,7 +262,7 @@ def evaluate_uav_navigation(
                 rollout_steps % progress_interval_steps == 0 or completed_trials == total_trials
             ):
                 print(
-                    f"[eval] cell={cell_index} step={rollout_steps}/{max_rollout_steps} "
+                    f"[eval] {scene_label} step={rollout_steps}/{max_rollout_steps} "
                     f"completed={completed_trials}/{total_trials}"
                 )
 
@@ -277,13 +310,12 @@ def evaluate_uav_navigation(
             "evaluation_finished_at": datetime.now(timezone.utc).isoformat(),
             "policy_mode": "deterministic_mean",
             "seed": seed,
-            "scene_cell": {
-                "index": cell_index,
-                "level": cell_index // num_cols,
-                "variant": cell_index % num_cols,
-                "rows": num_rows,
-                "columns": num_cols,
-                "cell_size_m": cell_size,
+            "scene": {
+                "profile": scene_profile,
+                "layout": scene_layout,
+                "evaluation_mode": evaluation_mode,
+                "origin": list(scene_origin),
+                "size_m": cell_size,
             },
             "num_envs": num_envs,
             "episodes_per_env": episodes_per_env,
@@ -308,17 +340,30 @@ def evaluate_uav_navigation(
             },
             "edge_pairs": edge_pair_results,
         }
+        if scene_layout == "grid":
+            result["scene_cell"] = {
+                "index": cell_index,
+                "level": cell_index // num_cols,
+                "variant": cell_index % num_cols,
+                "rows": num_rows,
+                "columns": num_cols,
+                "cell_size_m": cell_size,
+            }
         return result
     finally:
         if restore_training_cells:
             _restore_rng_state(rng_state)
-            set_uav_navigation_cells(
-                raw_env,
-                cell_indices=original_cells,
-                cell_size=cell_size,
-                num_rows=num_rows,
-                num_cols=num_cols,
-            )
+            if scene_layout == "grid":
+                set_uav_navigation_cells(
+                    raw_env,
+                    cell_indices=original_cells,
+                    cell_size=cell_size,
+                    num_rows=num_rows,
+                    num_cols=num_cols,
+                    grid_origin=scene_origin,
+                )
+            else:
+                set_uav_navigation_scene_origin(raw_env, scene_origin=scene_origin)
             with torch.inference_mode():
                 env.reset()
             raw_env.extras["log"] = {}
@@ -336,17 +381,24 @@ def write_evaluation_json(result: dict[str, Any], output_path: str | os.PathLike
 
 def print_evaluation_summary(result: dict[str, Any], output_path: Path | None = None) -> None:
     """Print the high-signal metrics from an evaluation result."""
-    cell = result["scene_cell"]
+    scene = result.get("scene", {"profile": "grid_8x8", "layout": "grid"})
     outcomes = result["outcomes"]
     collision = result["any_collision"]
     episode = result["episode"]
     print("=" * 72)
     print("Tilting UAV Navigation Evaluation")
     print("=" * 72)
-    print(
-        f"cell={cell['index']} (level={cell['level']}, variant={cell['variant']}) "
-        f"envs={result['num_envs']} trials={result['trials']} seed={result['seed']}"
-    )
+    if scene["layout"] == "grid":
+        cell = result["scene_cell"]
+        print(
+            f"cell={cell['index']} (level={cell['level']}, variant={cell['variant']}) "
+            f"envs={result['num_envs']} trials={result['trials']} seed={result['seed']}"
+        )
+    else:
+        print(
+            f"scene={scene['profile']} layout=single envs={result['num_envs']} "
+            f"trials={result['trials']} seed={result['seed']}"
+        )
     print(
         f"success={outcomes['success']['count']}/{result['trials']} "
         f"({100.0 * outcomes['success']['rate']:.2f}%) "

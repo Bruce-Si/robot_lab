@@ -21,14 +21,17 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
 
 
-PLANAR_LIDAR_RAY_COUNT = 36
-"""Number of rays in the 360-degree, 10-degree planar scan."""
+PLANAR_LIDAR_RAY_COUNT = 72
+"""Number of rays in the 360-degree, 5-degree planar scan."""
 
 PLANAR_POLICY_STATE_DIM = 7
 """Deployment-visible state features concatenated before the planar LiDAR scan."""
 
 UAV_PRIVILEGED_STATE_DIM = 95
 """Simulator-only expert features for the fixed 8-by-8 navigation scene."""
+
+UAV_SINGLE_SCENE_PRIVILEGED_STATE_DIM = 29
+"""Simulator-only expert features without the 8-by-8 cell encoding."""
 
 
 def planar_lidar_distances(
@@ -62,15 +65,21 @@ def uav_planar_lidar_proximity(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("lidar"),
     max_distance: float = 4.0,
+    expected_rays: int = PLANAR_LIDAR_RAY_COUNT,
 ) -> torch.Tensor:
-    """Return 36 normalized proximity values with beam zero pointing forward.
+    """Return normalized proximity values with beam zero pointing forward.
 
-    Isaac Lab generates a full scan from -180 degrees through +170 degrees. The
-    circular roll changes that order to 0, +10, ..., +170, -180, ..., -10 degrees.
+    Isaac Lab generates a full scan from -180 degrees through the final sample
+    before +180 degrees. The circular roll places the forward ray at index zero.
     A clear ray is zero and a close obstacle approaches one.
     """
-    distances = planar_lidar_distances(env, sensor_cfg, max_distance)
-    distances = torch.roll(distances, shifts=PLANAR_LIDAR_RAY_COUNT // 2, dims=1)
+    distances = planar_lidar_distances(
+        env,
+        sensor_cfg,
+        max_distance,
+        expected_rays=expected_rays,
+    )
+    distances = torch.roll(distances, shifts=expected_rays // 2, dims=1)
     return 1.0 - distances / max(max_distance, 1.0e-6)
 
 
@@ -105,11 +114,13 @@ def uav_planar_policy_observation(
     velocity_scale: float = 1.5,
     yaw_rate_scale: float = 1.0,
     max_distance: float = 4.0,
+    expected_rays: int = PLANAR_LIDAR_RAY_COUNT,
     debug_draw: bool = True,
+    debug_draw_lidar: bool = True,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("lidar"),
 ) -> torch.Tensor:
-    """Concatenate seven navigation features and the 36-ray scan for an MLP."""
+    """Concatenate seven navigation features and the configured planar scan."""
     state = uav_planar_state(
         env,
         command_name=command_name,
@@ -118,13 +129,19 @@ def uav_planar_policy_observation(
         yaw_rate_scale=yaw_rate_scale,
         asset_cfg=asset_cfg,
     )
-    lidar = uav_planar_lidar_proximity(env, sensor_cfg=sensor_cfg, max_distance=max_distance)
+    lidar = uav_planar_lidar_proximity(
+        env,
+        sensor_cfg=sensor_cfg,
+        max_distance=max_distance,
+        expected_rays=expected_rays,
+    )
     if debug_draw:
         _draw_planar_lidar_debug_lines(
             env,
             command_name=command_name,
             sensor_cfg=sensor_cfg,
             max_distance=max_distance,
+            draw_lidar_rays=debug_draw_lidar,
         )
     return torch.cat((state, lidar), dim=-1)
 
@@ -136,15 +153,17 @@ def uav_navigation_privileged_state(
     cell_size: float = 50.0,
     num_rows: int = 8,
     num_cols: int = 8,
+    include_scene_identity: bool = True,
     velocity_scale: float = 1.5,
     altitude_error_scale: float = 0.5,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Return simulator-only state for the navigation data-collection expert.
 
-    The actor and critic receive exact map-cell identity and coordinates, full rigid-body
-    motion, attitude, controller tracking error, and actuator state. This intentionally
-    privileged policy is trained only to collect successful simulation trajectories.
+    The actor and critic receive full rigid-body motion, attitude, controller tracking
+    error, and actuator state. Grid tasks additionally receive exact map-cell identity
+    and coordinates. This intentionally privileged policy is trained only to collect
+    successful simulation trajectories.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     command_term = env.command_manager.get_term(command_name)
@@ -175,18 +194,6 @@ def uav_navigation_privileged_state(
         (torch.sin(controller_yaw_error), torch.cos(controller_yaw_error)), dim=-1
     )
 
-    cell_index = getattr(env, "_uav_navigation_cell_index", None)
-    if cell_index is None:
-        cell_index = torch.arange(env.num_envs, device=env.device) % (num_rows * num_cols)
-    row = torch.div(cell_index, num_cols, rounding_mode="floor").to(torch.float32)
-    col = (cell_index % num_cols).to(torch.float32)
-    row = 2.0 * row / max(num_rows - 1, 1) - 1.0
-    col = 2.0 * col / max(num_cols - 1, 1) - 1.0
-    cell_coordinates = torch.stack((row, col), dim=-1)
-    scene_identity = F.one_hot(
-        cell_index.to(torch.long), num_classes=num_rows * num_cols
-    ).to(asset.data.root_pos_w.dtype)
-
     velocity_integral = action_term.velocity_integral_error / max(
         action_term.cfg.vel_integral_limit, 1.0e-6
     )
@@ -195,24 +202,34 @@ def uav_navigation_privileged_state(
         action_term.cfg.servo_angle_limit, 1.0e-6
     )
 
-    return torch.cat(
-        (
-            local_position_xy,
-            goal_local_xy,
-            altitude_error,
-            heading_features,
-            root_lin_vel_b,
-            root_ang_vel_b,
-            projected_gravity_b,
-            controller_yaw_features,
-            cell_coordinates,
-            scene_identity,
-            velocity_integral,
-            thrust_state,
-            servo_state,
-        ),
-        dim=-1,
-    )
+    state_parts = [
+        local_position_xy,
+        goal_local_xy,
+        altitude_error,
+        heading_features,
+        root_lin_vel_b,
+        root_ang_vel_b,
+        projected_gravity_b,
+        controller_yaw_features,
+    ]
+    if include_scene_identity:
+        cell_index = getattr(env, "_uav_navigation_cell_index", None)
+        if cell_index is None:
+            cell_index = torch.arange(env.num_envs, device=env.device) % (num_rows * num_cols)
+        row = torch.div(cell_index, num_cols, rounding_mode="floor").to(torch.float32)
+        col = (cell_index % num_cols).to(torch.float32)
+        row = 2.0 * row / max(num_rows - 1, 1) - 1.0
+        col = 2.0 * col / max(num_cols - 1, 1) - 1.0
+        state_parts.extend(
+            (
+                torch.stack((row, col), dim=-1),
+                F.one_hot(cell_index.to(torch.long), num_classes=num_rows * num_cols).to(
+                    asset.data.root_pos_w.dtype
+                ),
+            )
+        )
+    state_parts.extend((velocity_integral, thrust_state, servo_state))
+    return torch.cat(tuple(state_parts), dim=-1)
 
 
 def _goal_pose_errors(
@@ -239,7 +256,7 @@ def goal_reached_with_heading(
     env: ManagerBasedRLEnv,
     command_name: str = "pose_command",
     distance_threshold: float = 1.0,
-    heading_threshold: float = math.radians(20.0),
+    heading_threshold: float = math.radians(10.0),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Succeed only when both planar position and terminal yaw are within tolerance."""
@@ -251,7 +268,7 @@ def goal_pose_bonus(
     env: ManagerBasedRLEnv,
     command_name: str = "pose_command",
     distance_threshold: float = 1.0,
-    heading_threshold: float = math.radians(20.0),
+    heading_threshold: float = math.radians(10.0),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Return a sparse bonus using the same pose condition as success termination."""
@@ -281,8 +298,9 @@ def _draw_planar_lidar_debug_lines(
     command_name: str = "pose_command",
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("lidar"),
     max_distance: float = 4.0,
+    draw_lidar_rays: bool = True,
 ) -> None:
-    """Draw the selected viewer environment's planar scan and navigation goal."""
+    """Draw the navigation goal and optionally the selected environment's planar scan."""
     if not env.sim.has_gui():
         return
 
@@ -305,36 +323,42 @@ def _draw_planar_lidar_debug_lines(
             )
         draw_interface = _draw_planar_lidar_debug_lines._draw_interface
 
-        starts = ray_starts_w[env_index]
-        hits = sensor.data.ray_hits_w[env_index]
-        directions = ray_directions_w[env_index]
-        directions = directions / torch.linalg.norm(directions, dim=-1, keepdim=True).clamp_min(1.0e-6)
-        hit_distances = torch.linalg.norm(hits - starts, dim=-1)
-        valid_hits = (
-            torch.isfinite(hits).all(dim=-1)
-            & (hit_distances > 1.0e-6)
-            & (hit_distances <= max_distance + 1.0e-4)
-        )
-        miss_ends = starts + directions * max_distance
-        ends = torch.where(valid_hits.unsqueeze(-1), hits, miss_ends)
-
-        proximity = (1.0 - hit_distances / max(max_distance, 1.0e-6)).clamp(0.0, 1.0)
-        valid_hits_cpu = valid_hits.detach().cpu().tolist()
-        proximity_cpu = proximity.detach().cpu().tolist()
         colors = []
         thicknesses = []
-        for is_hit, proximity_value in zip(valid_hits_cpu, proximity_cpu):
-            if is_hit:
-                colors.append([proximity_value, 1.0 - proximity_value, 0.1, 1.0])
-                thicknesses.append(1.8)
-            else:
-                colors.append([0.1, 0.55, 1.0, 0.35])
-                thicknesses.append(0.8)
+        if draw_lidar_rays:
+            starts = ray_starts_w[env_index]
+            hits = sensor.data.ray_hits_w[env_index]
+            directions = ray_directions_w[env_index]
+            directions = directions / torch.linalg.norm(
+                directions, dim=-1, keepdim=True
+            ).clamp_min(1.0e-6)
+            hit_distances = torch.linalg.norm(hits - starts, dim=-1)
+            valid_hits = (
+                torch.isfinite(hits).all(dim=-1)
+                & (hit_distances > 1.0e-6)
+                & (hit_distances <= max_distance + 1.0e-4)
+            )
+            miss_ends = starts + directions * max_distance
+            ends = torch.where(valid_hits.unsqueeze(-1), hits, miss_ends)
+
+            proximity = (1.0 - hit_distances / max(max_distance, 1.0e-6)).clamp(0.0, 1.0)
+            valid_hits_cpu = valid_hits.detach().cpu().tolist()
+            proximity_cpu = proximity.detach().cpu().tolist()
+            for is_hit, proximity_value in zip(valid_hits_cpu, proximity_cpu):
+                if is_hit:
+                    colors.append([proximity_value, 1.0 - proximity_value, 0.1, 1.0])
+                    thicknesses.append(1.8)
+                else:
+                    colors.append([0.1, 0.55, 1.0, 0.35])
+                    thicknesses.append(0.8)
+        else:
+            starts = ray_starts_w.new_empty((0, 3))
+            ends = ray_starts_w.new_empty((0, 3))
 
         command_term = env.command_manager.get_term(command_name)
         goal_w = command_term.pos_command_w[env_index].clone()
 
-        # Keep the goal beacon and LiDAR scan in one draw call because
+        # Keep the goal beacon and optional LiDAR scan in one draw call because
         # clear_lines() clears every line owned by this debug-draw interface.
         beacon_start = goal_w.clone()
         beacon_start[2] = env.scene.env_origins[env_index, 2] + 0.05
@@ -370,9 +394,15 @@ def planar_lidar_collision(
     body_radius: float = 0.45,
     max_distance: float = 4.0,
     k_nearest: int = 2,
+    expected_rays: int = PLANAR_LIDAR_RAY_COUNT,
 ) -> torch.Tensor:
     """Detect a near collision from the mean of the closest horizontal rays."""
-    distances = planar_lidar_distances(env, sensor_cfg, max_distance)
+    distances = planar_lidar_distances(
+        env,
+        sensor_cfg,
+        max_distance,
+        expected_rays=expected_rays,
+    )
     nearest = torch.topk(
         distances,
         k=min(k_nearest, distances.shape[1]),
@@ -434,6 +464,7 @@ def set_uav_navigation_cells(
     cell_size: float = 50.0,
     num_rows: int = 8,
     num_cols: int = 8,
+    grid_origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> torch.Tensor:
     """Map each environment origin to a cell in the shared static USD grid.
 
@@ -467,34 +498,37 @@ def set_uav_navigation_cells(
 
     row = torch.div(indices, num_cols, rounding_mode="floor")
     col = indices % num_cols
-    origins = torch.zeros(env.num_envs, 3, device=env.device)
-    origins[:, 0] = (col.to(torch.float32) + 0.5) * cell_size
-    origins[:, 1] = (row.to(torch.float32) + 0.5) * cell_size
+    origin = torch.as_tensor(grid_origin, device=env.device, dtype=torch.float32).flatten()
+    if origin.numel() != 3:
+        raise ValueError(f"grid_origin must contain three values, got {origin.numel()}.")
+    origins = origin.expand(env.num_envs, 3).clone()
+    origins[:, 0] += (col.to(torch.float32) + 0.5) * cell_size
+    origins[:, 1] += (row.to(torch.float32) + 0.5) * cell_size
     env.scene._default_env_origins = origins
     env._uav_navigation_cell_index = indices
     return indices
 
 
-def setup_uav_static_usd_scene(
+def set_uav_navigation_scene_origin(
     env: ManagerBasedEnv,
-    env_ids: torch.Tensor | None,
-    scene_root: str = "/World/uav_navigation_scene",
-    cell_size: float = 50.0,
-    num_rows: int = 8,
-    num_cols: int = 8,
-) -> None:
-    """Enable static-scene collisions and map environments onto its cell grid."""
-    del env_ids
-    set_uav_navigation_cells(
-        env,
-        cell_indices=None,
-        cell_size=cell_size,
-        num_rows=num_rows,
-        num_cols=num_cols,
-    )
+    scene_origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> torch.Tensor:
+    """Place every parallel environment at one fixed shared-scene origin."""
+    origin = torch.as_tensor(scene_origin, device=env.device, dtype=torch.float32).flatten()
+    if origin.numel() != 3:
+        raise ValueError(f"scene_origin must contain three values, got {origin.numel()}.")
+    env.scene._default_env_origins = origin.expand(env.num_envs, 3).clone()
+    indices = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+    env._uav_navigation_cell_index = indices
+    return indices
 
+
+def _validate_uav_static_usd_collisions(
+    env: ManagerBasedEnv,
+    scene_root: str,
+) -> tuple[int, int, int]:
+    """Validate authored colliders without modifying the composed USD stage."""
     import isaaclab.sim as sim_utils
-    from isaaclab.sim import schemas
     from isaaclab.utils.mesh import PRIMITIVE_MESH_TYPES
     from pxr import UsdPhysics
 
@@ -512,21 +546,96 @@ def setup_uav_static_usd_scene(
     if not geometry_prims:
         raise RuntimeError(f"No ray-castable geometry found under {scene_root}.")
 
-    collision_cfg = schemas.CollisionPropertiesCfg(collision_enabled=True)
-    mesh_collision_cfg = schemas.ConvexHullPropertiesCfg()
-    mesh_count = 0
-    for prim in geometry_prims:
+    authored_geometry_prims = [prim for prim in geometry_prims if not prim.IsInstanceProxy()]
+    instance_proxy_count = len(geometry_prims) - len(authored_geometry_prims)
+    if not authored_geometry_prims:
+        raise RuntimeError(
+            f"No authored geometry available for collision validation under {scene_root}; "
+            f"found only {instance_proxy_count} instance-proxy geometries."
+        )
+
+    missing_collision_paths = []
+    disabled_collision_paths = []
+    for prim in authored_geometry_prims:
         prim_path = prim.GetPath().pathString
-        if UsdPhysics.CollisionAPI(prim):
-            schemas.modify_collision_properties(prim_path, collision_cfg, stage=stage)
-        else:
-            schemas.define_collision_properties(prim_path, collision_cfg, stage=stage)
-        if prim.GetTypeName() == "Mesh":
-            schemas.define_mesh_collision_properties(prim_path, mesh_collision_cfg, stage=stage)
-            mesh_count += 1
+        collision_api = UsdPhysics.CollisionAPI(prim)
+        if not collision_api:
+            missing_collision_paths.append(prim_path)
+        elif collision_api.GetCollisionEnabledAttr().Get() is False:
+            disabled_collision_paths.append(prim_path)
+
+    if missing_collision_paths or disabled_collision_paths:
+        details = []
+        if missing_collision_paths:
+            details.append(
+                f"missing CollisionAPI ({len(missing_collision_paths)}): "
+                + ", ".join(missing_collision_paths[:10])
+            )
+        if disabled_collision_paths:
+            details.append(
+                f"collision disabled ({len(disabled_collision_paths)}): "
+                + ", ".join(disabled_collision_paths[:10])
+            )
+        raise RuntimeError(
+            f"Static USD scene collision validation failed under {scene_root}; "
+            + "; ".join(details)
+            + ". Author enabled colliders in the source USD before launching the environment."
+        )
+
+    mesh_count = sum(prim.GetTypeName() == "Mesh" for prim in authored_geometry_prims)
+    return len(authored_geometry_prims), mesh_count, instance_proxy_count
+
+
+def setup_uav_static_usd_scene(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None,
+    scene_root: str = "/World/uav_navigation_scene",
+    cell_size: float = 50.0,
+    num_rows: int = 8,
+    num_cols: int = 8,
+    grid_origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    cell_indices: int | Sequence[int] | torch.Tensor | None = None,
+) -> None:
+    """Validate authored static-scene collisions and map environments onto its cell grid."""
+    del env_ids
+    set_uav_navigation_cells(
+        env,
+        cell_indices=cell_indices,
+        cell_size=cell_size,
+        num_rows=num_rows,
+        num_cols=num_cols,
+        grid_origin=grid_origin,
+    )
+    geometry_count, mesh_count, instance_proxy_count = _validate_uav_static_usd_collisions(
+        env, scene_root
+    )
 
     print(
         "[INFO] UAV static USD scene: "
-        f"{len(geometry_prims)} collision geometries ({mesh_count} meshes), "
+        f"validated {geometry_count} authored collision geometries ({mesh_count} meshes), "
+        f"skipped {instance_proxy_count} read-only instance-proxy visual geometries, "
         f"grid={num_rows}x{num_cols}, cell_size={cell_size:.1f} m, envs={env.num_envs}."
+    )
+
+
+def setup_uav_single_static_usd_scene(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None,
+    scene_root: str = "/World/uav_navigation_scene",
+    scene_origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    scene_size: float = 100.0,
+) -> None:
+    """Validate one shared static scene and give every environment the same origin."""
+    del env_ids
+    if scene_size <= 0.0:
+        raise ValueError("Single static USD scene size must be positive.")
+    set_uav_navigation_scene_origin(env, scene_origin=scene_origin)
+    geometry_count, mesh_count, instance_proxy_count = _validate_uav_static_usd_collisions(
+        env, scene_root
+    )
+    print(
+        "[INFO] UAV single static USD scene: "
+        f"validated {geometry_count} authored collision geometries ({mesh_count} meshes), "
+        f"skipped {instance_proxy_count} read-only instance-proxy visual geometries, "
+        f"origin={scene_origin}, size={scene_size:.1f} m, envs={env.num_envs}."
     )

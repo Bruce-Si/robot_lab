@@ -23,7 +23,7 @@ args = parser.parse_args()
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
-from pxr import Sdf, Usd, UsdGeom
+from pxr import Sdf, Usd, UsdGeom, UsdPhysics
 
 
 GEOMETRY_TYPES = {"Capsule", "Cone", "Cube", "Cylinder", "Mesh", "Sphere"}
@@ -119,9 +119,15 @@ def main() -> None:
             raise RuntimeError(f"Failed to copy shared boundary {source_boundary.GetPath()}.")
         dependency_prims.append(str(source_boundary.GetPath()))
 
-    # The baked v1 scene uses one shared ground instead of per-cell ground.
-    # Tilted body-frame LiDAR rays can hit it, so it is part of the observation.
-    keep_names = {cell_name, "GlobalGround", "Materials"}
+    # Keep the shared ground only when the selected cell has no authored collision
+    # ground. Retaining both produces overlapping ground geometry, and the current
+    # pillar scene authors GlobalGround as visual-only while each cell owns its
+    # physical Ground collider.
+    local_ground = derived_cell.GetChild("Ground")
+    has_local_collision_ground = local_ground.IsValid() and bool(UsdPhysics.CollisionAPI(local_ground))
+    keep_names = {cell_name, "Materials"}
+    if not has_local_collision_ground:
+        keep_names.add("GlobalGround")
     remove_paths = [child.GetPath() for child in derived_root.GetChildren() if child.GetName() not in keep_names]
     for prim_path in remove_paths:
         stage.RemovePrim(prim_path)
@@ -151,13 +157,23 @@ def main() -> None:
     ]
     if retained_cells != [cell_name]:
         raise RuntimeError(f"Expected only {cell_name}, found cells: {retained_cells}")
-    geometry_count = sum(prim.GetTypeName() in GEOMETRY_TYPES for prim in verified_stage.Traverse())
+    geometry_prims = [prim for prim in verified_stage.Traverse() if prim.GetTypeName() in GEOMETRY_TYPES]
+    missing_collision_paths = [
+        prim.GetPath().pathString for prim in geometry_prims if not UsdPhysics.CollisionAPI(prim)
+    ]
+    if missing_collision_paths:
+        raise RuntimeError(
+            f"Derived cell contains {len(missing_collision_paths)} geometries without CollisionAPI: "
+            + ", ".join(missing_collision_paths[:10])
+        )
+    geometry_count = len(geometry_prims)
 
     print(f"source={input_path}")
     print(f"derived={output_path}")
     print(f"default_prim={verified_root.GetPath()}")
     print(f"retained_cell={cell_name}")
     print(f"copied_dependencies={dependency_prims}")
+    print(f"retained_global_ground={not has_local_collision_ground}")
     print(f"geometry_count={geometry_count}")
     print(f"size_bytes={output_path.stat().st_size}")
 
